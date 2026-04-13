@@ -32,6 +32,6 @@ def get_top_etf_by_countervalue():
     # Sort by Countervalue in descending order
     df_sorted = df.sort_values(by='Countervalue', ascending=False)
     print(df_sorted.head(10))  # Print top 10 ETFs
-
+#ciao
 if __name__ == "__main__":
     get_top_etf_by_countervalue()
