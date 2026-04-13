@@ -10,7 +10,7 @@ import numpy as np
 
 '''CLIENT CHOICE OF DATA'''
 
-'''CHOOSING WETHER THE CLIENT IS INTERESTED IN SEEING SFDR LEGISLATED ETFS OR NOT'''
+'''CHOOSING WHETHER THE CLIENT IS INTERESTED IN SEEING SFDR LEGISLATED ETFS OR NOT'''
 
 print("Welcome to the ETF Data Analysis Tool!")
 print("Please choose the type of ETFs you are interested in:")
