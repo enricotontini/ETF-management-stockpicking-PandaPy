@@ -1,3 +1,7 @@
+
+'''                 EXAMPLE                 '''
+
+
 import pandas as pd
 
 import yfinance as yf
@@ -8,7 +12,9 @@ import requests
 
 import numpy as np
 
-'''CLIENT CHOICE OF DATA'''
+import time
+
+'''                 CLIENT CHOICE OF DATA                   '''
 
 '''CHOOSING WHETHER THE CLIENT IS INTERESTED IN SEEING SFDR LEGISLATED ETFS OR NOT'''
 
@@ -19,19 +25,22 @@ print("2. All ETFs")
 choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
-    print("You have chosen to see only SFDR Legislated ETFs.")
-    
+    print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
 elif choice == '2':
     print("You have chosen to see all ETFs.")
 else:
     print("Invalid choice. Please enter 1 or 2.")   
 
+''''                    DATA PULLING                    '''
 
+def search_greendeep():
+    url = "https://www.borsaitaliana.it/borsa/etf.html"
 
-''''DATA PULLING'''
+    page = requests.get(url)
 
+    soup = BeautifulSoup(page.text, 'html')
 
-
+    print(soup)
 
 '''DATA Management'''
 
