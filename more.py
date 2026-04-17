@@ -14,6 +14,20 @@ import numpy as np
 
 import time
 
+'''                 USED FUNCTIONS                  '''
+
+def search_greendeep():
+    url = "https://www.borsaitaliana.it/borsa/etf.html"
+
+    page = requests.get(url)
+
+    soup = BeautifulSoup(page.text, 'html')
+
+    soup.find_all('table')
+    
+    print(soup)
+
+
 '''                 CLIENT CHOICE OF DATA                   '''
 
 '''CHOOSING WHETHER THE CLIENT IS INTERESTED IN SEEING SFDR LEGISLATED ETFS OR NOT'''
@@ -26,6 +40,7 @@ choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
     print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
+    search_greendeep()
 elif choice == '2':
     print("You have chosen to see all ETFs.")
 else:
@@ -33,14 +48,7 @@ else:
 
 ''''                    DATA PULLING                    '''
 
-def search_greendeep():
-    url = "https://www.borsaitaliana.it/borsa/etf.html"
 
-    page = requests.get(url)
-
-    soup = BeautifulSoup(page.text, 'html')
-
-    print(soup)
 
 '''DATA Management'''
 
