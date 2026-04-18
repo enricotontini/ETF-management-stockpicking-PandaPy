@@ -20,7 +20,10 @@ from playwright.sync_api import sync_playwright
 
 '''                 USED FUNCTIONS                  '''
 
-def search_greendeep():
+
+'''         Scraping            ETFS'''
+
+def search_deep():
     url = "https://www.borsaitaliana.it/borsa/etf.html"
     all_rows = []
     headers_row = []
@@ -34,6 +37,8 @@ def search_greendeep():
 
         try:
             page.wait_for_selector("table", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(2000)    
         except Exception:
             print("[WARNING] Table never appeared.")
             browser.close()
@@ -68,7 +73,7 @@ def search_greendeep():
 
                 if next_btn.is_visible() and next_btn.is_enabled():
                     next_btn.click()
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(30000)
                     page_num += 1
                 else:
                     print("[INFO] Last page reached.")
@@ -91,6 +96,32 @@ def search_greendeep():
     print(df.head())
     return df
 
+'''         DEBUG PER TROVARE BOTTONE SCORRIMENTO           '''
+
+def debug_pagination():
+    url = "https://www.borsaitaliana.it/borsa/etf.html"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        page = browser.new_page()
+        page.goto(url, timeout=30000)
+        page.wait_for_selector("table", timeout=15000)
+
+        
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+
+        for tag in ["nav", "ul", "div"]:
+            for el in soup.find_all(tag):
+                text = el.get_text(strip=True)
+                if any(c in text for c in ["›", "»", "next", "Next", "avanti", "Avanti", ">"]):
+                    print(f"\n── {tag} ──────────────────")
+                    print(el.prettify()[:500])
+
+        input("Premi INVIO per chiudere il browser...") 
+        browser.close()
+
+debug_pagination()
 
 
 '''                 CLIENT CHOICE OF DATA                   '''
@@ -105,7 +136,7 @@ choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
     print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
-    search_greendeep()
+    search_deep()
 
 elif choice == '2':
     print("You have chosen to see all ETFs.")
