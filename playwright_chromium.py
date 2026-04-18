@@ -22,6 +22,8 @@ from playwright.sync_api import sync_playwright
 
 def search_greendeep():
     url = "https://www.borsaitaliana.it/borsa/etf.html"
+    all_rows = []
+    headers_row = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -30,40 +32,62 @@ def search_greendeep():
         print("[INFO] Loading page (JS rendering)...")
         page.goto(url, timeout=30000)
 
-        # Wait until the table is actually injected by JS
         try:
             page.wait_for_selector("table", timeout=15000)
         except Exception:
-            print("[WARNING] Table never appeared — check the URL or selector.")
+            print("[WARNING] Table never appeared.")
             browser.close()
             return pd.DataFrame()
 
-        html = page.content() 
+        page_num = 1
+
+        while True:
+            print(f"[INFO] Scraping page {page_num}...")
+            html = page.content()
+            soup = BeautifulSoup(html, "html.parser")
+
+            table = soup.find("table")
+            if not table:
+                print("[WARNING] No table found.")
+                break
+
+            # Headers solo dalla prima pagina
+            if not headers_row:
+                headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
+
+            for tr in table.find_all("tr")[1:]:
+                cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if cols:
+                    all_rows.append(cols)
+
+            # ── Cerca bottone next ───────────────────────────
+            try:
+                next_btn = page.locator(
+                    "a[aria-label='Next'], a.next, li.next a, a:has-text('›'), a:has-text('»')"
+                ).first
+
+                if next_btn.is_visible() and next_btn.is_enabled():
+                    next_btn.click()
+                    page.wait_for_timeout(2000)
+                    page_num += 1
+                else:
+                    print("[INFO] Last page reached.")
+                    break
+            except Exception:
+                print("[INFO] No next button found — end of pagination.")
+                break
+
         browser.close()
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    tables = soup.find_all("table")
-    if not tables:
-        print("[WARNING] No table found even after JS render.")
-        print(soup.prettify()[:2000])
+    if not all_rows:
+        print("[WARNING] No rows collected.")
         return pd.DataFrame()
 
-    table = tables[0]
-
-    # ── Build DataFrame ──────────────────────────────
-    headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
-    rows = []
-    for tr in table.find_all("tr")[1:]:
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if cols:
-            rows.append(cols)
-
-    if not rows:
-        print("[WARNING] Table found but no rows parsed.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows, columns=headers_row[:len(rows[0])] if headers_row else None)
+    df = pd.DataFrame(
+        all_rows,
+        columns=headers_row[:len(all_rows[0])] if headers_row else None
+    )
+    print(f"✓ Total ETFs collected: {len(df)}")
     print(df.head())
     return df
 
