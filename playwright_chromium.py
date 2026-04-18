@@ -105,6 +105,7 @@ def search_deep():
         columns=headers_row[:len(all_rows[0])] if headers_row else None
     )
     print(f"✓ Totale ETF raccolti: {len(df)}")
+    print(df)
     df.to_csv("etf_borsa_italiana.csv", index=False)
     print("✓ Salvato in etf_borsa_italiana.csv")
     return df
