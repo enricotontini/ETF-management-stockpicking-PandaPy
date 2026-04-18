@@ -1,30 +1,29 @@
-
-'''                 EXAMPLE                 '''
-
-
 import pandas as pd
-
 import yfinance as yf
-
 from bs4 import BeautifulSoup
-
 import requests
-
 import numpy as np
-
 import time
-
 from playwright.sync_api import sync_playwright
+from playwright._impl._errors import TargetClosedError
+import signal
 
-#MUST EXECUTE 'playwright install' in LINUX terminal in order to load the tool
+# ── Flag stop ────────────────────────────────────
+stop_flag = False
 
-'''                 USED FUNCTIONS                  '''
+def handle_sigint(sig, frame):
+    global stop_flag
+    print("\n[INFO] CTRL+C — stop dopo questa pagina...")
+    stop_flag = True
 
+signal.signal(signal.SIGINT, handle_sigint)
 
-'''         Scraping            ETFS'''
 
 def search_deep():
-    url = "https://www.borsaitaliana.it/borsa/etf.html"
+    global stop_flag
+    stop_flag = False
+
+    base_url = "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"
     all_rows = []
     headers_row = []
 
@@ -32,57 +31,70 @@ def search_deep():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        print("[INFO] Loading page (JS rendering)...")
-        page.goto(url, timeout=30000)
+        print("[INFO] Loading page... (premi CTRL+C per fermare)")
+        page.goto("https://www.borsaitaliana.it/borsa/etf.html", timeout=30000)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_timeout(2000)
 
         try:
-            page.wait_for_selector("table", timeout=15000)
-            page.wait_for_load_state("networkidle", timeout=15000)
-            page.wait_for_timeout(2000)    
+            accept_btn = page.locator(
+                "button:has-text('Accept'), button:has-text('Accetta'), "
+                "button:has-text('Accetto'), #ccc-notify-accept, "
+                "button.ccc-accept-button"
+            ).first
+            if accept_btn.is_visible():
+                accept_btn.click()
+                print("[INFO] Banner cookie chiuso.")
+                page.wait_for_timeout(1000)
         except Exception:
-            print("[WARNING] Table never appeared.")
-            browser.close()
-            return pd.DataFrame()
+            pass
 
         page_num = 1
 
-        while True:
-            print(f"[INFO] Scraping page {page_num}...")
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-
-            table = soup.find("table")
-            if not table:
-                print("[WARNING] No table found.")
-                break
-
-            # Headers solo dalla prima pagina
-            if not headers_row:
-                headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
-
-            for tr in table.find_all("tr")[1:]:
-                cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if cols:
-                    all_rows.append(cols)
-
-            # ── Cerca bottone next ───────────────────────────
+        while not stop_flag:
             try:
-                next_btn = page.locator(
-                    "a[aria-label='Next'], a.next, li.next a, a:has-text('›'), a:has-text('»')"
-                ).first
+                url = base_url.format(page_num)
+                print(f"[INFO] Scraping page {page_num}...")
+                page.goto(url, timeout=30000)
+                page.wait_for_selector("table", timeout=15000)
+                page.wait_for_timeout(2000)
 
-                if next_btn.is_visible() and next_btn.is_enabled():
-                    next_btn.click()
-                    page.wait_for_timeout(30000)
-                    page_num += 1
-                else:
-                    print("[INFO] Last page reached.")
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                table = soup.find("table")
+
+                if not table:
+                    print("[WARNING] No table found.")
                     break
-            except Exception:
-                print("[INFO] No next button found — end of pagination.")
+
+                if not headers_row:
+                    headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
+
+                rows_this_page = []
+                for tr in table.find_all("tr")[1:]:
+                    cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                    if cols:
+                        nome_tag = tr.find("td")
+                        if nome_tag and nome_tag.find("a"):
+                            cols[0] = nome_tag.find("a").get_text(strip=True)
+                        rows_this_page.append(cols)
+
+                if not rows_this_page:
+                    print("[INFO] Pagina vuota — fine.")
+                    break
+
+                all_rows.extend(rows_this_page)
+                print(f"    → righe fin ora: {len(all_rows)}")
+                page_num += 1
+
+            except TargetClosedError:
+                print("[INFO] Browser chiuso — interruzione.")
                 break
 
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     if not all_rows:
         print("[WARNING] No rows collected.")
@@ -92,60 +104,25 @@ def search_deep():
         all_rows,
         columns=headers_row[:len(all_rows[0])] if headers_row else None
     )
-    print(f"✓ Total ETFs collected: {len(df)}")
-    print(df.head())
+    print(f"✓ Totale ETF raccolti: {len(df)}")
+    df.to_csv("etf_borsa_italiana.csv", index=False)
+    print("✓ Salvato in etf_borsa_italiana.csv")
     return df
-
-'''         DEBUG PER TROVARE BOTTONE SCORRIMENTO           '''
-
-def debug_pagination():
-    url = "https://www.borsaitaliana.it/borsa/etf.html"
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
-        page.goto(url, timeout=30000)
-        page.wait_for_selector("table", timeout=15000)
-
-        
-        html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
-
-        for tag in ["nav", "ul", "div"]:
-            for el in soup.find_all(tag):
-                text = el.get_text(strip=True)
-                if any(c in text for c in ["›", "»", "next", "Next", "avanti", "Avanti", ">"]):
-                    print(f"\n── {tag} ──────────────────")
-                    print(el.prettify()[:500])
-
-        input("Premi INVIO per chiudere il browser...") 
-        browser.close()
-
-debug_pagination()
 
 
 '''                 CLIENT CHOICE OF DATA                   '''
 
-'''CHOOSING WHETHER THE CLIENT IS INTERESTED IN SEEING SFDR LEGISLATED ETFS OR NOT'''
-
 print("Welcome to the ETF Data Analysis Tool!")
 print("Please choose the type of ETFs you are interested in:")
 print("1. SFDR Legislated ETFs")
-print("2. All ETFs")    
+print("2. All ETFs")
 choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
     print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
     search_deep()
-
 elif choice == '2':
     print("You have chosen to see all ETFs.")
+    search_deep()
 else:
-    print("Invalid choice. Please enter 1 or 2.")   
-
-''''                    DATA PULLING                    '''
-
-
-
-'''DATA Management'''
-
+    print("Invalid choice. Please enter 1 or 2.")
