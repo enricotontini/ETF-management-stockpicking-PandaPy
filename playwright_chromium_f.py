@@ -7,6 +7,7 @@ import time
 from playwright.sync_api import sync_playwright
 from playwright._impl._errors import TargetClosedError
 import signal
+from playwright._impl._errors import TargetClosedError
 
 # ── Flag stop ────────────────────────────────────
 stop_flag = False
@@ -114,10 +115,12 @@ def search_greendeep():
     all_rows = []
     headers_row = []
 
+    
     urls = [
-        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=8&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"),
-        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=9&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"),
+        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%208&lang=it&page={}"),
+        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%209&lang=it&page={}"),
     ]
+    
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -140,46 +143,60 @@ def search_greendeep():
             pass
 
         for sfdr_label, base_url in urls:
+            if stop_flag:
+                break
             print(f"\n[INFO] Scraping {sfdr_label}...")
             page_num = 1
 
             while not stop_flag:
-                url = base_url.format(page_num)
-                print(f"    pagina {page_num}...")
-                page.goto(url, timeout=30000)
-                page.wait_for_selector("table", timeout=15000)
-                page.wait_for_timeout(2000)
+                try:
+                    url = base_url.format(page_num)
+                    print(f"    pagina {page_num}...")
+                    page.goto(url, timeout=30000)
+                    page.wait_for_selector("table", timeout=15000)
+                    page.wait_for_timeout(2000)
 
-                html = page.content()
-                soup = BeautifulSoup(html, "html.parser")
-                table = soup.find("table")
+                    html = page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    table = soup.find("table")
 
-                if not table:
+                    if not table:
+                        break
+
+                    if not headers_row:
+                        headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
+                        headers_row.append("SFDR")
+
+                    rows_this_page = []
+                    for tr in table.find_all("tr")[1:]:
+                        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                        if cols:
+                            nome_tag = tr.find("td")
+                            if nome_tag and nome_tag.find("a"):
+                                cols[0] = nome_tag.find("a").get_text(strip=True)
+                            cols.append(sfdr_label)
+                            rows_this_page.append(cols)
+
+                    if not rows_this_page:
+                        print(f"    [INFO] Fine {sfdr_label}.")
+                        break
+
+                    all_rows.extend(rows_this_page)
+                    print(f"    → righe fin ora: {len(all_rows)}")
+                    page_num += 1
+
+                except TargetClosedError:
+                    print("[INFO] Browser chiuso — interruzione.")
                     break
 
-                if not headers_row:
-                    headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
-                    headers_row.append("SFDR")  # ✅ aggiungi colonna SFDR
-
-                rows_this_page = []
-                for tr in table.find_all("tr")[1:]:
-                    cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-                    if cols:
-                        nome_tag = tr.find("td")
-                        if nome_tag and nome_tag.find("a"):
-                            cols[0] = nome_tag.find("a").get_text(strip=True)
-                        cols.append(sfdr_label)  # ✅ aggiungi Art.8 o Art.9
-                        rows_this_page.append(cols)
-
-                if not rows_this_page:
-                    print(f"    [INFO] Fine {sfdr_label}.")
-                    break
-
-                all_rows.extend(rows_this_page)
-                print(f"    → righe fin ora: {len(all_rows)}")
-                page_num += 1
-
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
+        
+    if not all_rows:
+        print("[WARNING] Nessun ETF trovato.")
+        return pd.DataFrame()
 
     df = pd.DataFrame(
         all_rows,
@@ -201,9 +218,9 @@ choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
     print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
-    search_green1deep()
+    search_greendeep()
 elif choice == '2':
-    print("You have chosen to see all ETFs.")
+    print("You have chosen to see all ETFs under SFDR Legislation.")
     search_deep()
 else:
     print("Invalid choice. Please enter 1 or 2.")
