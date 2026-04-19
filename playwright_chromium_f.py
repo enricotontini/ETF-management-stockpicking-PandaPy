@@ -110,6 +110,86 @@ def search_deep():
     print("✓ Salvato in etf_borsa_italiana.csv")
     return df
 
+def search_greendeep():
+    all_rows = []
+    headers_row = []
+
+    urls = [
+        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=8&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"),
+        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=9&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"),
+    ]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        # Cookie
+        page.goto("https://www.borsaitaliana.it/borsa/etf.html", timeout=30000)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_timeout(2000)
+        try:
+            accept_btn = page.locator(
+                "button:has-text('Accept'), button:has-text('Accetta'), "
+                "button:has-text('Accetto'), #ccc-notify-accept, "
+                "button.ccc-accept-button"
+            ).first
+            if accept_btn.is_visible():
+                accept_btn.click()
+                page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        for sfdr_label, base_url in urls:
+            print(f"\n[INFO] Scraping {sfdr_label}...")
+            page_num = 1
+
+            while not stop_flag:
+                url = base_url.format(page_num)
+                print(f"    pagina {page_num}...")
+                page.goto(url, timeout=30000)
+                page.wait_for_selector("table", timeout=15000)
+                page.wait_for_timeout(2000)
+
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                table = soup.find("table")
+
+                if not table:
+                    break
+
+                if not headers_row:
+                    headers_row = [th.get_text(strip=True) for th in table.find_all("th")]
+                    headers_row.append("SFDR")  # ✅ aggiungi colonna SFDR
+
+                rows_this_page = []
+                for tr in table.find_all("tr")[1:]:
+                    cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                    if cols:
+                        nome_tag = tr.find("td")
+                        if nome_tag and nome_tag.find("a"):
+                            cols[0] = nome_tag.find("a").get_text(strip=True)
+                        cols.append(sfdr_label)  # ✅ aggiungi Art.8 o Art.9
+                        rows_this_page.append(cols)
+
+                if not rows_this_page:
+                    print(f"    [INFO] Fine {sfdr_label}.")
+                    break
+
+                all_rows.extend(rows_this_page)
+                print(f"    → righe fin ora: {len(all_rows)}")
+                page_num += 1
+
+        browser.close()
+
+    df = pd.DataFrame(
+        all_rows,
+        columns=headers_row[:len(all_rows[0])] if headers_row else None
+    )
+    print(f"\n✓ Totale ETF SFDR raccolti: {len(df)}")
+    print(df['SFDR'].value_counts())
+    df.to_csv("etf_sfdr.csv", index=False)
+    print("✓ Salvato in etf_sfdr.csv")
+    return df
 
 '''                 CLIENT CHOICE OF DATA                   '''
 
@@ -121,7 +201,7 @@ choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
     print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
-    search_deep()
+    search_green1deep()
 elif choice == '2':
     print("You have chosen to see all ETFs.")
     search_deep()
