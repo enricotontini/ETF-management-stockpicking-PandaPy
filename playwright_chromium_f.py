@@ -245,6 +245,7 @@ def search_greendeep():
     print("✓ Salvato in etf_sfdr.csv")
     return df
 
+#--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 def extract_isin_from_href(href):
     try:
@@ -253,7 +254,6 @@ def extract_isin_from_href(href):
         return isin if len(isin) == 12 else None
     except Exception:
         return None
-
 
 def enrich_with_yfinance(df):
     global stop_flag
