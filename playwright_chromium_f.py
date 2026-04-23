@@ -7,6 +7,8 @@ import time
 from playwright.sync_api import sync_playwright
 from playwright._impl._errors import TargetClosedError
 import signal
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ── Flag stop ────────────────────────────────────
 stop_flag = False
@@ -98,7 +100,7 @@ def search_deep():
                 print(f"[INFO] Scraping page {page_num}...")
                 goto_with_retry(page, url)
                 page.wait_for_selector("table", timeout=15000)
-                page.wait_for_timeout(3000)
+                page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
 
                 html = page.content()
                 soup = BeautifulSoup(html, "html.parser")
@@ -172,7 +174,7 @@ def search_greendeep():
         page.wait_for_load_state("networkidle", timeout=15000)
         page.wait_for_timeout(2000)
         accept_cookies(page)
-
+        page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
         for sfdr_label, base_url in urls:
             if stop_flag:
                 break
@@ -185,7 +187,7 @@ def search_greendeep():
                     print(f"    pagina {page_num}...")
                     goto_with_retry(page, url)
                     page.wait_for_selector("table", timeout=15000)
-                    page.wait_for_timeout(3000)
+                    page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
 
                     html = page.content()
                     soup = BeautifulSoup(html, "html.parser")
@@ -244,77 +246,46 @@ def search_greendeep():
     return df
 
 
+def extract_isin_from_href(href):
+    try:
+        filename = href.split("/")[-1]       # LU1681040496-ETFP.html
+        isin = filename.split("-")[0]         # LU1681040496
+        return isin if len(isin) == 12 else None
+    except Exception:
+        return None
+
+
 def enrich_with_yfinance(df):
     global stop_flag
-    stop_flag = False  # ✅ reset flag
-    results = []
+    stop_flag = False
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    df = df.copy()
+    df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
-        page.goto("https://www.borsaitaliana.it/borsa/etf.html", timeout=30000)
-        page.wait_for_timeout(3000)
-        accept_cookies(page)
+    isins_validi = df["ISIN"].dropna().tolist()
+    print(f"[INFO] {len(isins_validi)} ISIN trovati su {len(df)} ETF")
+    print("[INFO] Download prezzi da yfinance... (CTRL+C per fermare)")
 
-        for i, row in df.iterrows():
-            if stop_flag:  # ✅ controlla CTRL+C ad ogni ETF
-                print("[INFO] Stop — salvo quello che ho fin ora.")
-                break
-
-            href = row.get("Link", "")
-            if not href:
-                results.append({})
-                continue
-
-            try:
-                url = "https://www.borsaitaliana.it" + href
-                goto_with_retry(page, url)  # ✅ retry su ERR_ABORTED
-                page.wait_for_timeout(4000)
-
-                html = page.content()
-                soup = BeautifulSoup(html, "html.parser")
-                scheda = get_scheda_data(soup)
-
-                isin = scheda.get("ISIN")
-                if isin:
-                    try:
-                        ticker = yf.Ticker(isin)
-                        info = ticker.fast_info
-                        scheda["YF_Price"] = getattr(info, "last_price", None)
-                        scheda["YF_Volume"] = getattr(info, "three_month_average_volume", None)
-                        print(f"[{i}] {row['Nome'][:30]} → {isin} → {scheda.get('YF_Price', 'N/A')}")
-                    except Exception as yf_err:
-                        print(f"[{i}] yfinance errore: {yf_err}")
-                        scheda["YF_Price"] = None
-                        scheda["YF_Volume"] = None
-                else:
-                    scheda["YF_Price"] = None
-                    scheda["YF_Volume"] = None
-                    print(f"[{i}] {row['Nome'][:30]} → ISIN non trovato")
-
-                results.append(scheda)
-                time.sleep(0.5)
-
-            except TargetClosedError:
-                print(f"[{i}] Browser chiuso — interruzione.")
-                break
-            except Exception as e:
-                print(f"[{i}] Errore: {e}")
-                results.append({})
-
+    prices = {}
+    for i, isin in enumerate(isins_validi):
+        if stop_flag:
+            print("[INFO] Stop — uso prezzi raccolti fin ora.")
+            break
         try:
-            browser.close()
+            # ✅ Cerca solo prezzo, senza scaricare storico
+            ticker = yf.Ticker(isin)
+            price = ticker.fast_info.last_price
+            prices[isin] = price if price and price > 0 else None
         except Exception:
-            pass
+            prices[isin] = None
 
-    # ✅ Salva anche se interrotto a metà
-    enriched = pd.DataFrame(results)
-    df_partial = df.iloc[:len(results)].reset_index(drop=True)
-    df_out = pd.concat([df_partial, enriched], axis=1)
-    df_out.to_csv("etf_enriched.csv", index=False)
-    print(f"✓ Salvato in etf_enriched.csv ({len(df_out)} ETF)")
-    return df_out
+        if i % 50 == 0:
+            print(f"    → {i}/{len(isins_validi)} completati...")
+
+    df["YF_Price"] = df["ISIN"].map(prices)
+    df.to_csv("etf_enriched.csv", index=False)
+    print(f"✓ Salvato in etf_enriched.csv ({len(df)} ETF)")
+    return df
 
 '''                 CLIENT CHOICE OF DATA                   '''
 
