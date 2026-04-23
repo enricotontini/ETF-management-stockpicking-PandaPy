@@ -245,18 +245,23 @@ def search_greendeep():
 
 
 def enrich_with_yfinance(df):
+    global stop_flag
+    stop_flag = False  # ✅ reset flag
     results = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        # ✅ Sessione iniziale + cookie
         page.goto("https://www.borsaitaliana.it/borsa/etf.html", timeout=30000)
         page.wait_for_timeout(3000)
         accept_cookies(page)
 
         for i, row in df.iterrows():
+            if stop_flag:  # ✅ controlla CTRL+C ad ogni ETF
+                print("[INFO] Stop — salvo quello che ho fin ora.")
+                break
+
             href = row.get("Link", "")
             if not href:
                 results.append({})
@@ -264,21 +269,25 @@ def enrich_with_yfinance(df):
 
             try:
                 url = "https://www.borsaitaliana.it" + href
-                page.goto(url, timeout=30000)
+                goto_with_retry(page, url)  # ✅ retry su ERR_ABORTED
                 page.wait_for_timeout(4000)
 
                 html = page.content()
                 soup = BeautifulSoup(html, "html.parser")
                 scheda = get_scheda_data(soup)
 
-                # ✅ yfinance con ISIN
                 isin = scheda.get("ISIN")
                 if isin:
-                    ticker = yf.Ticker(isin)
-                    info = ticker.fast_info
-                    scheda["YF_Price"] = getattr(info, "last_price", None)
-                    scheda["YF_Volume"] = getattr(info, "three_month_average_volume", None)
-                    print(f"[{i}] {row['Nome'][:30]} → {isin} → {scheda.get('YF_Price', 'N/A')}")
+                    try:
+                        ticker = yf.Ticker(isin)
+                        info = ticker.fast_info
+                        scheda["YF_Price"] = getattr(info, "last_price", None)
+                        scheda["YF_Volume"] = getattr(info, "three_month_average_volume", None)
+                        print(f"[{i}] {row['Nome'][:30]} → {isin} → {scheda.get('YF_Price', 'N/A')}")
+                    except Exception as yf_err:
+                        print(f"[{i}] yfinance errore: {yf_err}")
+                        scheda["YF_Price"] = None
+                        scheda["YF_Volume"] = None
                 else:
                     scheda["YF_Price"] = None
                     scheda["YF_Volume"] = None
@@ -287,19 +296,25 @@ def enrich_with_yfinance(df):
                 results.append(scheda)
                 time.sleep(0.5)
 
+            except TargetClosedError:
+                print(f"[{i}] Browser chiuso — interruzione.")
+                break
             except Exception as e:
                 print(f"[{i}] Errore: {e}")
                 results.append({})
 
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
 
+    # ✅ Salva anche se interrotto a metà
     enriched = pd.DataFrame(results)
-    df = df.reset_index(drop=True)
-    df = pd.concat([df, enriched], axis=1)
-    df.to_csv("etf_enriched.csv", index=False)
-    print("✓ Salvato in etf_enriched.csv")
-    return df
-
+    df_partial = df.iloc[:len(results)].reset_index(drop=True)
+    df_out = pd.concat([df_partial, enriched], axis=1)
+    df_out.to_csv("etf_enriched.csv", index=False)
+    print(f"✓ Salvato in etf_enriched.csv ({len(df_out)} ETF)")
+    return df_out
 
 '''                 CLIENT CHOICE OF DATA                   '''
 
