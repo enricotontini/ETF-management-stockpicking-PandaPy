@@ -272,7 +272,6 @@ def enrich_with_yfinance(df):
             print("[INFO] Stop — uso prezzi raccolti fin ora.")
             break
         try:
-            # ✅ Cerca solo prezzo, senza scaricare storico
             ticker = yf.Ticker(isin)
             price = ticker.fast_info.last_price
             prices[isin] = price if price and price > 0 else None
@@ -288,28 +287,37 @@ def enrich_with_yfinance(df):
     return df
 
 def download_storico(df, period="1y"):
-    """Scarica storico prezzi per tutti gli ETF nel df."""
-    
+    global stop_flag
+    stop_flag = False
+
     isins = df["ISIN"].dropna().tolist()
-    print(f"[INFO] Download storico {period} per {len(isins)} ETF...")
+    print(f"[INFO] Download storico {period} per {len(isins)} ETF... (CTRL+C per fermare)")
 
-    try:
-        # ✅ Batch download — una sola chiamata per tutti
-        storico = yf.download(
-            tickers=isins,
-            period=period,
-            auto_adjust=True,
-            progress=True
-        )
+    all_storico = {}
 
-        # Salva su CSV
-        storico.to_csv(f"storico_{period}.csv")
-        print(f"✓ Salvato in storico_{period}.csv")
-        return storico
+    for i, isin in enumerate(isins):
+        if stop_flag:
+            print("[INFO] Stop — salvo storico parziale.")
+            break
+        try:
+            storico = yf.Ticker(isin).history(period=period, auto_adjust=True)
+            if not storico.empty:
+                storico["ISIN"] = isin
+                all_storico[isin] = storico
+        except Exception:
+            pass
 
-    except Exception as e:
-        print(f"[ERROR] Download storico fallito: {e}")
+        if i % 50 == 0:
+            print(f"    → {i}/{len(isins)} completati...")
+
+    if not all_storico:
+        print("[WARNING] Nessun storico scaricato.")
         return pd.DataFrame()
+
+    df_storico = pd.concat(all_storico.values())
+    df_storico.to_csv(f"storico_{period}.csv")
+    print(f"✓ Salvato in storico_{period}.csv ({len(all_storico)} ETF)")
+    return df_storico
 
 '''                 CLIENT CHOICE OF DATA                   '''
 
