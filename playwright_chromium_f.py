@@ -287,6 +287,30 @@ def enrich_with_yfinance(df):
     print(f"✓ Salvato in etf_enriched.csv ({len(df)} ETF)")
     return df
 
+def download_storico(df, period="1y"):
+    """Scarica storico prezzi per tutti gli ETF nel df."""
+    
+    isins = df["ISIN"].dropna().tolist()
+    print(f"[INFO] Download storico {period} per {len(isins)} ETF...")
+
+    try:
+        # ✅ Batch download — una sola chiamata per tutti
+        storico = yf.download(
+            tickers=isins,
+            period=period,
+            auto_adjust=True,
+            progress=True
+        )
+
+        # Salva su CSV
+        storico.to_csv(f"storico_{period}.csv")
+        print(f"✓ Salvato in storico_{period}.csv")
+        return storico
+
+    except Exception as e:
+        print(f"[ERROR] Download storico fallito: {e}")
+        return pd.DataFrame()
+
 '''                 CLIENT CHOICE OF DATA                   '''
 
 print("Welcome to the ETF Data Analysis Tool!")
@@ -296,12 +320,16 @@ print("2. All ETFs")
 choice = input("Enter the number corresponding to your choice: ")
 
 if choice == '1':
-    print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
     df = search_greendeep()
     if not df.empty:
         enrich = input("Vuoi arricchire con dati yfinance? (y/n): ")
         if enrich == 'y':
             df = enrich_with_yfinance(df)
+            
+            storico = input("Vuoi scaricare lo storico prezzi? (y/n): ")
+            if storico == 'y':
+                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "1y"
+                download_storico(df, period=period)
 elif choice == '2':
     print("You have chosen to see all ETFs.")
     df = search_deep()
@@ -309,5 +337,10 @@ elif choice == '2':
         enrich = input("Vuoi arricchire con dati yfinance? (y/n): ")
         if enrich == 'y':
             df = enrich_with_yfinance(df)
+            
+            storico = input("Vuoi scaricare lo storico prezzi? (y/n): ")
+            if storico == 'y':
+                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "1y"
+                download_storico(df, period=period)
 else:
     print("Invalid choice. Please enter 1 or 2.")
