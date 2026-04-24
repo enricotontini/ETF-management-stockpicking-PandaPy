@@ -419,6 +419,8 @@ def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
                     failed += 1
                 completati += 1
                 print("Download Eseguito per ",completati,"ETF ...")
+                df["YF_Price"] = df["ISIN"].map(prices)
+                df.to_csv("etf_enriched.csv", index=False)
 
         if completati % 100 == 0 or batch_start + batch_size >= len(isins_validi):
             print(f"    → {completati}/{len(isins_validi)} completati | falliti: {failed}")
@@ -426,8 +428,8 @@ def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
         if batch_start + batch_size < len(isins_validi) and not stop_flag:
             time.sleep(batch_pause)
 
-    df["YF_Price"] = df["ISIN"].map(prices)
-    df.to_csv("etf_enriched.csv", index=False)
+    '''df["YF_Price"] = df["ISIN"].map(prices)
+    df.to_csv("etf_enriched.csv", index=False)'''
     print(f"✓ Salvato in etf_enriched.csv ({len(df)} ETF, {failed} senza prezzo)")
     return df
 
