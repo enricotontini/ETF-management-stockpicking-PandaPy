@@ -334,7 +334,7 @@ def fetch_storico(isin, period, max_retries=4):
     return isin, None
 
 
-def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=4.0):
+def download_storico(df, period="6mo", chunk_size=200):
     global stop_flag
     stop_flag = False
 
@@ -343,48 +343,82 @@ def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=4.0
         df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
     isins = df["ISIN"].dropna().tolist()
-    print(f"[INFO] Download storico {period} — {len(isins)} ISINs, {workers} workers, "
-          f"batch {batch_size}, pausa {batch_pause}s tra batch")
+    tickers = [f"{isin}.MI" for isin in isins]
+    isin_map = {f"{isin}.MI": isin for isin in isins}
 
-    all_storico = {}
-    completati = 0
-    failed = 0
+    print(f"[INFO] Download bulk storico {period} — {len(tickers)} ETF in chunk da {chunk_size}...")
 
-    for batch_start in range(0, len(isins), batch_size):
+    all_chunks = []
+
+    for i in range(0, len(tickers), chunk_size):
         if stop_flag:
-            print("[INFO] Stop — salvo storico parziale.")
+            print("[INFO] Stop richiesto.")
             break
 
-        batch = isins[batch_start : batch_start + batch_size]
+        batch = tickers[i : i + chunk_size]
+        print(f"    → Chunk {i//chunk_size + 1}/{-(-len(tickers)//chunk_size)}: {len(batch)} ticker...")
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(fetch_storico, isin, period): isin for isin in batch}
-            for future in as_completed(futures):
-                if stop_flag:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                isin, storico = future.result()
-                if storico is not None:
-                    all_storico[isin] = storico
-                else:
-                    failed += 1
-                completati += 1
+        try:
+            raw = yf.download(
+                " ".join(batch),
+                period=period,
+                auto_adjust=True,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+        except Exception as e:
+            print(f"    [WARN] Chunk fallito: {e}")
+            continue
 
-        print(f"    → {completati}/{len(isins)} completati | "
-              f"scaricati: {len(all_storico)} | falliti: {failed}")
+        if raw.empty or raw.isna().all().all():
+            print(f"    [WARN] Chunk vuoto.")
+            continue
 
-        if batch_start + batch_size < len(isins) and not stop_flag:
-            time.sleep(batch_pause)
+        # Gestisce sia (ticker, metric) che (metric, ticker)
+        if raw.columns.nlevels == 2:
+            l0 = raw.columns.get_level_values(0)[0]
+            metrics = {"Close", "Open", "High", "Low", "Volume", "Adj Close"}
+            if l0 in metrics:
+                raw.columns.names = ["metric", "ticker"]
+                raw = raw.swaplevel(axis=1)
+            raw.columns.names = ["ticker", "metric"]
+        else:
+            # Ticker singolo — flat
+            raw = pd.concat({batch[0]: raw}, axis=1)
+            raw.columns.names = ["ticker", "metric"]
 
-    if not all_storico:
-        print("[WARNING] Nessun storico scaricato.")
+        tickers_presenti = set(raw.columns.get_level_values("ticker").unique())
+
+        for ticker in batch:
+            if ticker not in tickers_presenti:
+                continue
+            try:
+                chunk = raw.loc[:, (ticker, "Close")].dropna().to_frame(name="Close")
+                for col in ["Open", "High", "Low", "Volume"]:
+                    try:
+                        chunk[col] = raw.loc[:, (ticker, col)]
+                    except KeyError:
+                        pass
+                if chunk.empty:
+                    continue
+                chunk["ISIN"] = isin_map[ticker]
+                all_chunks.append(chunk)
+            except Exception:
+                continue
+
+        print(f"    → {len(all_chunks)} ETF totali con dati finora")
+
+    if not all_chunks:
+        print("[WARNING] Nessun ETF con dati validi.")
         return pd.DataFrame()
 
-    df_storico = pd.concat(all_storico.values())
+    df_storico = pd.concat(all_chunks)
+    scaricati = df_storico["ISIN"].nunique()
+    falliti = len(tickers) - scaricati
     df_storico.to_csv(f"storico_{period}.csv")
-    print(f"✓ Salvato in storico_{period}.csv ({len(all_storico)} ETF, {failed} falliti)")
+    print(f"✓ Salvato in storico_{period}.csv ({scaricati} ETF, {falliti} falliti)")
     return df_storico
-
 
 def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
     global stop_flag
@@ -540,12 +574,15 @@ if choice == '1':
     if not df.empty:
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
-            if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "6mo"
-                df_storico = download_storico(df, period=period, workers=3)
-                if not df_storico.empty:
-                    if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
-                        analisi_etf(df_storico, df_enriched=df)
+        if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
+            period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+            if period == "1d":
+                print("[WARN] '1d' restituisce 1 sola riga — uso 6mo")
+                period = "6mo"
+            df_storico = download_storico(df, period=period)
+            if not df_storico.empty:
+                if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
+                    analisi_etf(df_storico, df_enriched=df)
 
 elif choice == '2':
     print("You have chosen to see all ETFs.")
@@ -553,12 +590,15 @@ elif choice == '2':
     if not df.empty:
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
-            if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "6mo"
-                df_storico = download_storico(df, period=period, workers=3)
-                if not df_storico.empty:
-                    if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
-                        analisi_etf(df_storico, df_enriched=df)
+        if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
+            period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+            if period == "1d":
+                print("[WARN] '1d' restituisce 1 sola riga — uso 6mo")
+                period = "6mo"
+            df_storico = download_storico(df, period=period)
+            if not df_storico.empty:
+                if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
+                    analisi_etf(df_storico, df_enriched=df)
 
 else:
     print("Invalid choice. Please enter 1 or 2.")
