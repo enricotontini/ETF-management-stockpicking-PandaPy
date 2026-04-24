@@ -65,7 +65,6 @@ def extract_isin_from_href(href):
 # ── Scraping helpers ─────────────────────────────
 
 def scrape_page(page_num, base_url, sfdr_label=None):
-    """Ogni thread ha il suo browser Playwright."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -104,7 +103,6 @@ def scrape_page(page_num, base_url, sfdr_label=None):
 
 
 def find_last_page(base_url):
-    """Trova l'ultima pagina disponibile."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -116,7 +114,7 @@ def find_last_page(base_url):
 
             page.goto(base_url.format(1), timeout=30000)
             page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
-            page.wait_for_timeout(3000)  # ✅ aspetta che la paginazione sia caricata
+            page.wait_for_timeout(3000)
 
             html = page.content()
             soup = BeautifulSoup(html, "html.parser")
@@ -130,9 +128,6 @@ def find_last_page(base_url):
                         max_page = max(max_page, n)
                     except Exception:
                         pass
-
-            # ✅ Se trova solo poche pagine probabilmente non ha caricato tutto
-            # Prova anche a cercare i link numerici visibili
             for a in soup.find_all("a"):
                 txt = a.get_text(strip=True)
                 if txt.isdigit():
@@ -140,8 +135,6 @@ def find_last_page(base_url):
 
             print(f"[INFO] Ultima pagina trovata: {max_page}")
 
-            # ✅ Verifica andando direttamente all'ultima pagina
-            # Se esiste pagina max_page+10 significa che ce ne sono di più
             test_url = base_url.format(max_page + 10)
             page.goto(test_url, timeout=15000)
             page.wait_for_timeout(2000)
@@ -151,7 +144,7 @@ def find_last_page(base_url):
             rows_test = table_test.find_all("tr")[1:] if table_test else []
             if rows_test:
                 print(f"[INFO] Ci sono più di {max_page} pagine — uso fallback 500")
-                return 500  # fallback alto, scrape_page gestisce le pagine vuote
+                return 500
 
             return max_page
 
@@ -163,7 +156,6 @@ def find_last_page(base_url):
 
 
 def get_headers(base_url, sfdr_label=None):
-    """Recupera headers della tabella."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -185,74 +177,6 @@ def get_headers(base_url, sfdr_label=None):
 
 
 # ── Search functions ─────────────────────────────
-
-def search_greendeep_fast(workers=5):
-    global stop_flag
-    stop_flag = False
-
-    urls = [
-        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%208&lang=it&page={}"),
-        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%209&lang=it&page={}"),
-    ]
-
-    all_rows = []
-    headers_row = None
-
-    for sfdr_label, base_url in urls:
-        if stop_flag:
-            break
-
-        last_page = find_last_page(base_url)
-        print(f"\n[INFO] Scraping {sfdr_label} — max {last_page} pagine con {workers} thread...")
-
-        # ✅ Scrapa a blocchi di 20 pagine — fermati se il blocco è vuoto
-        page_num = 1
-        rows_before = len(all_rows)
-
-        while not stop_flag and page_num <= last_page:
-            block = list(range(page_num, min(page_num + 20, last_page + 1)))
-            block_rows = []
-            completati = 0
-
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(scrape_page, n, base_url, sfdr_label): n for n in block}
-                for future in as_completed(futures):
-                    if stop_flag:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    rows = future.result()
-                    if rows:
-                        block_rows.extend(rows)
-                    completati += 1
-
-            all_rows.extend(block_rows)
-            print(f"    → pagine {page_num}-{block[-1]}: {len(block_rows)} righe | totale: {len(all_rows)}")
-
-            # ✅ Se il blocco non ha aggiunto righe — fine
-            if len(block_rows) == 0:
-                print(f"    [INFO] Blocco vuoto — fine {sfdr_label}.")
-                break
-
-            page_num += 20
-
-        if headers_row is None:
-            headers_row = get_headers(base_url, sfdr_label)
-
-    if not all_rows:
-        print("[WARNING] Nessun ETF trovato.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        all_rows,
-        columns=headers_row[:len(all_rows[0])] if headers_row else None
-    ).drop_duplicates()
-
-    print(f"\n✓ Totale ETF SFDR raccolti: {len(df)}")
-    print(df['SFDR'].value_counts())
-    df.to_csv("etf_sfdr.csv", index=False)
-    print("✓ Salvato in etf_sfdr.csv")
-    return df
-
 
 def search_deep_fast(workers=5):
     global stop_flag
@@ -283,7 +207,6 @@ def search_deep_fast(workers=5):
         all_rows.extend(block_rows)
         print(f"    → pagine {page_num}-{block[-1]}: {len(block_rows)} righe | totale: {len(all_rows)}")
 
-        # ✅ Blocco vuoto — fine
         if len(block_rows) == 0:
             print("[INFO] Blocco vuoto — fine scraping.")
             break
@@ -306,6 +229,69 @@ def search_deep_fast(workers=5):
     return df
 
 
+def search_greendeep_fast(workers=5):
+    global stop_flag
+    stop_flag = False
+
+    urls = [
+        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%208&lang=it&page={}"),
+        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%209&lang=it&page={}"),
+    ]
+
+    all_rows = []
+    headers_row = None
+
+    for sfdr_label, base_url in urls:
+        if stop_flag:
+            break
+
+        last_page = find_last_page(base_url)
+        print(f"\n[INFO] Scraping {sfdr_label} — max {last_page} pagine con {workers} thread...")
+
+        page_num = 1
+
+        while not stop_flag and page_num <= last_page:
+            block = list(range(page_num, min(page_num + 20, last_page + 1)))
+            block_rows = []
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(scrape_page, n, base_url, sfdr_label): n for n in block}
+                for future in as_completed(futures):
+                    if stop_flag:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    rows = future.result()
+                    if rows:
+                        block_rows.extend(rows)
+
+            all_rows.extend(block_rows)
+            print(f"    → pagine {page_num}-{block[-1]}: {len(block_rows)} righe | totale: {len(all_rows)}")
+
+            if len(block_rows) == 0:
+                print(f"    [INFO] Blocco vuoto — fine {sfdr_label}.")
+                break
+
+            page_num += 20
+
+        if headers_row is None:
+            headers_row = get_headers(base_url, sfdr_label)
+
+    if not all_rows:
+        print("[WARNING] Nessun ETF trovato.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        all_rows,
+        columns=headers_row[:len(all_rows[0])] if headers_row else None
+    ).drop_duplicates()
+
+    print(f"\n✓ Totale ETF SFDR raccolti: {len(df)}")
+    print(df['SFDR'].value_counts())
+    df.to_csv("etf_sfdr.csv", index=False)
+    print("✓ Salvato in etf_sfdr.csv")
+    return df
+
+
 # ── yfinance functions ───────────────────────────
 
 def fetch_price(isin):
@@ -318,22 +304,13 @@ def fetch_price(isin):
 
 def fetch_storico(isin, period):
     try:
-        time.sleep(0.5)  # ✅ pausa per evitare rate limit
         storico = yf.Ticker(isin).history(period=period, auto_adjust=True)
         if not storico.empty:
             storico["ISIN"] = isin
             return isin, storico
         return isin, None
     except Exception as e:
-        if "Too Many Requests" in str(e):
-            time.sleep(5)  # ✅ pausa lunga su rate limit
-            try:
-                storico = yf.Ticker(isin).history(period=period, auto_adjust=True)
-                if not storico.empty:
-                    storico["ISIN"] = isin
-                    return isin, storico
-            except Exception:
-                pass
+        print(f"[WARN] {isin}: {e}")
         return isin, None
 
 
@@ -343,10 +320,10 @@ def enrich_with_yfinance(df, workers=10):
 
     df = df.copy()
     df["ISIN"] = df["Link"].apply(extract_isin_from_href)
-
     isins_validi = df["ISIN"].dropna().tolist()
+
     print(f"[INFO] {len(isins_validi)} ISIN trovati su {len(df)} ETF")
-    print(f"[INFO] Download prezzi con {workers} thread paralleli... (CTRL+C per fermare)")
+    print(f"[INFO] Download prezzi con {workers} thread paralleli...")
 
     prices = {}
     completati = 0
@@ -355,7 +332,6 @@ def enrich_with_yfinance(df, workers=10):
         futures = {executor.submit(fetch_price, isin): isin for isin in isins_validi}
         for future in as_completed(futures):
             if stop_flag:
-                print("[INFO] Stop — cancello tasks rimanenti.")
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
             isin, price = future.result()
@@ -370,25 +346,16 @@ def enrich_with_yfinance(df, workers=10):
     return df
 
 
-def download_storico(df, period="1y", workers=3):
+def download_storico(df, period="6mo", workers=3):  # ✅ default 6mo, workers ridotti
     global stop_flag
     stop_flag = False
 
-    print(f"[DEBUG] Colonne df: {df.columns.tolist()}")
-
     if "ISIN" not in df.columns:
-        print("[INFO] Colonna ISIN non trovata — estraggo da Link...")
         df = df.copy()
         df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
     isins = df["ISIN"].dropna().tolist()
-    print(f"[DEBUG] ISIN validi: {len(isins)}")
-
-    if not isins:
-        print("[WARNING] Nessun ISIN trovato.")
-        return pd.DataFrame()
-
-    print(f"[INFO] Download storico {period} con {workers} thread paralleli... (CTRL+C per fermare)")
+    print(f"[INFO] Download storico {period} con {workers} thread paralleli...")
 
     all_storico = {}
     completati = 0
@@ -405,9 +372,7 @@ def download_storico(df, period="1y", workers=3):
                 all_storico[isin] = storico
             completati += 1
             if completati % 50 == 0:
-                print(f"    → {completati}/{len(isins)} completati...")
-
-    print(f"[DEBUG] Storici scaricati: {len(all_storico)}")
+                print(f"    → {completati}/{len(isins)} completati, {len(all_storico)} scaricati...")
 
     if not all_storico:
         print("[WARNING] Nessun storico scaricato.")
@@ -427,12 +392,18 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
     print(f"[DEBUG] Righe storico: {len(df_storico)}")
     print(f"[DEBUG] ISIN unici: {df_storico['ISIN'].nunique()}")
 
+    # ✅ Filtro adattivo basato sui dati reali
+    righe_per_etf = df_storico.groupby("ISIN").size()
+    mediana = righe_per_etf.median()
+    min_righe = max(10, int(mediana * 0.5))
+    print(f"[DEBUG] Mediana righe per ETF: {mediana} — filtro minimo: {min_righe}")
+
     print("[INFO] Attendo 10s per evitare rate limit...")
     time.sleep(10)
 
     print(f"[INFO] Scarico benchmark {benchmark_isin}...")
     try:
-        bench = yf.Ticker(benchmark_isin).history(period="2y", auto_adjust=True)
+        bench = yf.Ticker(benchmark_isin).history(period="2y", auto_adjust=True)  # ✅ niente session
         bench_ret = bench["Close"].ffill().pct_change(fill_method=None).dropna()
         print(f"[DEBUG] Benchmark righe: {len(bench_ret)}")
     except Exception as e:
@@ -443,7 +414,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
 
     for isin, gruppo in df_storico.groupby("ISIN"):
         close = gruppo["Close"].sort_index().dropna()
-        if len(close) < 30:
+        if len(close) < min_righe:  # ✅ filtro adattivo
             continue
 
         rendimenti = close.ffill().pct_change(fill_method=None).dropna()
@@ -460,7 +431,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
         if bench_ret is not None:
             try:
                 comune = rendimenti.index.intersection(bench_ret.index)
-                if len(comune) > 30:
+                if len(comune) > 5:  # ✅ abbassato da 30 a 5
                     r = rendimenti.loc[comune]
                     b = bench_ret.loc[comune]
                     cov = np.cov(r, b)
@@ -488,7 +459,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
         })
 
     if not risultati:
-        print("[WARNING] Nessun ETF ha superato il filtro minimo 30 righe.")
+        print("[WARNING] Nessun ETF ha superato il filtro minimo.")
         return pd.DataFrame()
 
     df_analisi = pd.DataFrame(risultati).sort_values("Sharpe_Ratio", ascending=False)
@@ -524,10 +495,8 @@ if choice == '1':
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
             if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-                print("[INFO] Attendo 30s per evitare rate limit yfinance...")
-                time.sleep(30)
-                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "1y"
-                df_storico = download_storico(df, period=period)
+                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "6mo"
+                df_storico = download_storico(df, period=period, workers=3)
                 if not df_storico.empty:
                     if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
                         analisi_etf(df_storico, df_enriched=df)
@@ -539,10 +508,8 @@ elif choice == '2':
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
             if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-                print("[INFO] Attendo 60s per evitare rate limit yfinance...")
-                time.sleep(60)  # ✅ da 30 a 60
-                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "1y"
-                df_storico = download_storico(df, period=period)
+                period = input("Periodo (1d/5d/1mo/3mo/6mo/1y/2y/5y): ") or "6mo"
+                df_storico = download_storico(df, period=period, workers=3)
                 if not df_storico.empty:
                     if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
                         analisi_etf(df_storico, df_enriched=df)
