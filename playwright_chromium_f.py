@@ -8,6 +8,7 @@ from playwright._impl._errors import TargetClosedError
 import signal
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -417,6 +418,7 @@ def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
                 if price is None:
                     failed += 1
                 completati += 1
+                print("Download Eseguito per ",completati,"ETF ...")
 
         if completati % 100 == 0 or batch_start + batch_size >= len(isins_validi):
             print(f"    → {completati}/{len(isins_validi)} completati | falliti: {failed}")
