@@ -294,59 +294,46 @@ def search_greendeep_fast(workers=5):
 
 # ── yfinance functions ───────────────────────────
 
+def isin_to_tickers(isin):
+    """Borsa Italiana ETFs resolve better with .MI suffix on Yahoo Finance."""
+    return [f"{isin}.MI", isin]
+
+
 def fetch_price(isin):
-    try:
-        price = yf.Ticker(isin).fast_info.last_price
-        return isin, price if price and price > 0 else None
-    except Exception:
-        return isin, None
+    for ticker_str in isin_to_tickers(isin):
+        try:
+            price = yf.Ticker(ticker_str).fast_info.last_price
+            if price and price > 0:
+                return isin, price
+        except Exception:
+            continue
+    return isin, None
 
 
-def fetch_storico(isin, period):
-    try:
-        storico = yf.Ticker(isin).history(period=period, auto_adjust=True)
-        if not storico.empty:
-            storico["ISIN"] = isin
-            return isin, storico
-        return isin, None
-    except Exception as e:
-        print(f"[WARN] {isin}: {e}")
-        return isin, None
-
-
-def enrich_with_yfinance(df, workers=10):
-    global stop_flag
-    stop_flag = False
-
-    df = df.copy()
-    df["ISIN"] = df["Link"].apply(extract_isin_from_href)
-    isins_validi = df["ISIN"].dropna().tolist()
-
-    print(f"[INFO] {len(isins_validi)} ISIN trovati su {len(df)} ETF")
-    print(f"[INFO] Download prezzi con {workers} thread paralleli...")
-
-    prices = {}
-    completati = 0
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_price, isin): isin for isin in isins_validi}
-        for future in as_completed(futures):
-            if stop_flag:
-                executor.shutdown(wait=False, cancel_futures=True)
+def fetch_storico(isin, period, max_retries=4):
+    for ticker_str in isin_to_tickers(isin):
+        for attempt in range(max_retries):
+            try:
+                storico = yf.Ticker(ticker_str).history(period=period, auto_adjust=True)
+                if not storico.empty:
+                    storico["ISIN"] = isin
+                    return isin, storico
+                break  # empty, no error → wrong ticker format, try next
+            except Exception as e:
+                msg = str(e)
+                if "Invalid ISIN" in msg:
+                    break  # bare ISIN rejected → skip straight to .MI
+                if "Too Many Requests" in msg or "rate limit" in msg.lower():
+                    if attempt < max_retries - 1:
+                        wait = (2 ** (attempt + 1)) + random.uniform(0, 1.5)
+                        time.sleep(wait)
+                        continue
+                print(f"[WARN] {ticker_str}: {e}")
                 break
-            isin, price = future.result()
-            prices[isin] = price
-            completati += 1
-            if completati % 50 == 0:
-                print(f"    → {completati}/{len(isins_validi)} completati...")
-
-    df["YF_Price"] = df["ISIN"].map(prices)
-    df.to_csv("etf_enriched.csv", index=False)
-    print(f"✓ Salvato in etf_enriched.csv ({len(df)} ETF)")
-    return df
+    return isin, None
 
 
-def download_storico(df, period="6mo", workers=3):  # ✅ default 6mo, workers ridotti
+def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=4.0):
     global stop_flag
     stop_flag = False
 
@@ -355,24 +342,38 @@ def download_storico(df, period="6mo", workers=3):  # ✅ default 6mo, workers r
         df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
     isins = df["ISIN"].dropna().tolist()
-    print(f"[INFO] Download storico {period} con {workers} thread paralleli...")
+    print(f"[INFO] Download storico {period} — {len(isins)} ISINs, {workers} workers, "
+          f"batch {batch_size}, pausa {batch_pause}s tra batch")
 
     all_storico = {}
     completati = 0
+    failed = 0
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_storico, isin, period): isin for isin in isins}
-        for future in as_completed(futures):
-            if stop_flag:
-                print("[INFO] Stop — salvo storico parziale.")
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            isin, storico = future.result()
-            if storico is not None:
-                all_storico[isin] = storico
-            completati += 1
-            if completati % 50 == 0:
-                print(f"    → {completati}/{len(isins)} completati, {len(all_storico)} scaricati...")
+    for batch_start in range(0, len(isins), batch_size):
+        if stop_flag:
+            print("[INFO] Stop — salvo storico parziale.")
+            break
+
+        batch = isins[batch_start : batch_start + batch_size]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_storico, isin, period): isin for isin in batch}
+            for future in as_completed(futures):
+                if stop_flag:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                isin, storico = future.result()
+                if storico is not None:
+                    all_storico[isin] = storico
+                else:
+                    failed += 1
+                completati += 1
+
+        print(f"    → {completati}/{len(isins)} completati | "
+              f"scaricati: {len(all_storico)} | falliti: {failed}")
+
+        if batch_start + batch_size < len(isins) and not stop_flag:
+            time.sleep(batch_pause)
 
     if not all_storico:
         print("[WARNING] Nessun storico scaricato.")
@@ -380,9 +381,53 @@ def download_storico(df, period="6mo", workers=3):  # ✅ default 6mo, workers r
 
     df_storico = pd.concat(all_storico.values())
     df_storico.to_csv(f"storico_{period}.csv")
-    print(f"✓ Salvato in storico_{period}.csv ({len(all_storico)} ETF)")
+    print(f"✓ Salvato in storico_{period}.csv ({len(all_storico)} ETF, {failed} falliti)")
     return df_storico
 
+
+def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
+    global stop_flag
+    stop_flag = False
+
+    df = df.copy()
+    df["ISIN"] = df["Link"].apply(extract_isin_from_href)
+    isins_validi = df["ISIN"].dropna().tolist()
+
+    print(f"[INFO] {len(isins_validi)} ISIN trovati su {len(df)} ETF")
+    print(f"[INFO] Download prezzi con {workers} workers, batch {batch_size}...")
+
+    prices = {}
+    completati = 0
+    failed = 0
+
+    for batch_start in range(0, len(isins_validi), batch_size):
+        if stop_flag:
+            break
+
+        batch = isins_validi[batch_start : batch_start + batch_size]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_price, isin): isin for isin in batch}
+            for future in as_completed(futures):
+                if stop_flag:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                isin, price = future.result()
+                prices[isin] = price
+                if price is None:
+                    failed += 1
+                completati += 1
+
+        if completati % 100 == 0 or batch_start + batch_size >= len(isins_validi):
+            print(f"    → {completati}/{len(isins_validi)} completati | falliti: {failed}")
+
+        if batch_start + batch_size < len(isins_validi) and not stop_flag:
+            time.sleep(batch_pause)
+
+    df["YF_Price"] = df["ISIN"].map(prices)
+    df.to_csv("etf_enriched.csv", index=False)
+    print(f"✓ Salvato in etf_enriched.csv ({len(df)} ETF, {failed} senza prezzo)")
+    return df
 
 # ── Analisi ──────────────────────────────────────
 
