@@ -9,8 +9,13 @@ import signal
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+from tqdm import tqdm
+import glob
+import os
+from datetime import datetime
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 
 # ── Flag stop ────────────────────────────────────
 stop_flag = False
@@ -323,7 +328,7 @@ def fetch_storico(isin, period, max_retries=4):
             except Exception as e:
                 msg = str(e)
                 if "Invalid ISIN" in msg:
-                    break  # bare ISIN rejected → skip straight to .MI
+                    break  # bare ISIN rejected → skip to .MI
                 if "Too Many Requests" in msg or "rate limit" in msg.lower():
                     if attempt < max_retries - 1:
                         wait = (2 ** (attempt + 1)) + random.uniform(0, 1.5)
@@ -334,7 +339,7 @@ def fetch_storico(isin, period, max_retries=4):
     return isin, None
 
 
-def download_storico(df, period="6mo", chunk_size=200):
+def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=8.0):
     global stop_flag
     stop_flag = False
 
@@ -343,82 +348,74 @@ def download_storico(df, period="6mo", chunk_size=200):
         df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
     isins = df["ISIN"].dropna().tolist()
-    tickers = [f"{isin}.MI" for isin in isins]
-    isin_map = {f"{isin}.MI": isin for isin in isins}
+    checkpoint_file = f"storico_{period}.csv"
 
-    print(f"[INFO] Download bulk storico {period} — {len(tickers)} ETF in chunk da {chunk_size}...")
-
-    all_chunks = []
-
-    for i in range(0, len(tickers), chunk_size):
-        if stop_flag:
-            print("[INFO] Stop richiesto.")
-            break
-
-        batch = tickers[i : i + chunk_size]
-        print(f"    → Chunk {i//chunk_size + 1}/{-(-len(tickers)//chunk_size)}: {len(batch)} ticker...")
-
+    # ── Carica checkpoint se esiste ───────────────────────────────────
+    all_storico = {}
+    if os.path.exists(checkpoint_file):
         try:
-            raw = yf.download(
-                " ".join(batch),
-                period=period,
-                auto_adjust=True,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
+            df_checkpoint = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
+            if "ISIN" in df_checkpoint.columns and not df_checkpoint.empty:
+                for isin, gruppo in df_checkpoint.groupby("ISIN"):
+                    all_storico[isin] = gruppo
+                isins_rimanenti = [i for i in isins if i not in all_storico]
+                print(f"[INFO] Checkpoint trovato: {len(all_storico)} già scaricati, "
+                      f"{len(isins_rimanenti)} rimanenti")
+                isins = isins_rimanenti
+            else:
+                print("[INFO] Checkpoint vuoto o malformato — ricomincio da zero")
         except Exception as e:
-            print(f"    [WARN] Chunk fallito: {e}")
-            continue
+            print(f"[WARN] Checkpoint non leggibile ({e}) — ricomincio da zero")
 
-        if raw.empty or raw.isna().all().all():
-            print(f"    [WARN] Chunk vuoto.")
-            continue
+    if not isins:
+        print("[INFO] Tutti gli ETF già scaricati nel checkpoint.")
+        return pd.concat(all_storico.values())
 
-        # Gestisce sia (ticker, metric) che (metric, ticker)
-        if raw.columns.nlevels == 2:
-            l0 = raw.columns.get_level_values(0)[0]
-            metrics = {"Close", "Open", "High", "Low", "Volume", "Adj Close"}
-            if l0 in metrics:
-                raw.columns.names = ["metric", "ticker"]
-                raw = raw.swaplevel(axis=1)
-            raw.columns.names = ["ticker", "metric"]
-        else:
-            # Ticker singolo — flat
-            raw = pd.concat({batch[0]: raw}, axis=1)
-            raw.columns.names = ["ticker", "metric"]
+    print(f"[INFO] Download storico {period} — {len(isins)} ISINs, {workers} workers...")
+    failed = 0
 
-        tickers_presenti = set(raw.columns.get_level_values("ticker").unique())
+    with tqdm(total=len(isins), unit="ETF", ncols=80, colour="green") as pbar:
+        for batch_start in range(0, len(isins), batch_size):
+            if stop_flag:
+                print("\n[INFO] Stop — salvo checkpoint parziale.")
+                break
 
-        for ticker in batch:
-            if ticker not in tickers_presenti:
-                continue
-            try:
-                chunk = raw.loc[:, (ticker, "Close")].dropna().to_frame(name="Close")
-                for col in ["Open", "High", "Low", "Volume"]:
-                    try:
-                        chunk[col] = raw.loc[:, (ticker, col)]
-                    except KeyError:
-                        pass
-                if chunk.empty:
-                    continue
-                chunk["ISIN"] = isin_map[ticker]
-                all_chunks.append(chunk)
-            except Exception:
-                continue
+            batch = isins[batch_start : batch_start + batch_size]
 
-        print(f"    → {len(all_chunks)} ETF totali con dati finora")
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(fetch_storico, isin, period): isin for isin in batch}
+                for future in as_completed(futures):
+                    if stop_flag:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    isin, storico = future.result()
+                    if storico is not None:
+                        all_storico[isin] = storico
+                    else:
+                        failed += 1
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        "ok": len(all_storico),
+                        "fail": failed,
+                        "batch": f"{batch_start//batch_size + 1}/{-(-len(isins)//batch_size)}"
+                    })
 
-    if not all_chunks:
-        print("[WARNING] Nessun ETF con dati validi.")
+            # ── Salva checkpoint dopo ogni batch ─────────────────────
+            if all_storico:
+                pd.concat(all_storico.values()).to_csv(checkpoint_file)
+
+            if batch_start + batch_size < len(isins) and not stop_flag:
+                time.sleep(batch_pause)
+
+    if not all_storico:
+        print("[WARNING] Nessun storico scaricato.")
         return pd.DataFrame()
 
-    df_storico = pd.concat(all_chunks)
-    scaricati = df_storico["ISIN"].nunique()
-    falliti = len(tickers) - scaricati
-    df_storico.to_csv(f"storico_{period}.csv")
-    print(f"✓ Salvato in storico_{period}.csv ({scaricati} ETF, {falliti} falliti)")
+    df_storico = pd.concat(all_storico.values())
+    df_storico.to_csv(checkpoint_file)
+    print(f"✓ Salvato in {checkpoint_file} ({len(all_storico)} ETF, {failed} falliti)")
     return df_storico
+
 
 def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
     global stop_flag
@@ -453,7 +450,7 @@ def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
                     failed += 1
                 completati += 1
 
-        # ── Save once per batch, not once per ETF ──
+        # ── Salva una volta per batch ─────────────────────────────────
         df["YF_Price"] = df["ISIN"].map(prices)
         df.to_csv("etf_enriched.csv", index=False)
         print(f"    → {completati}/{len(isins_validi)} completati | falliti: {failed} | salvato")
@@ -464,28 +461,46 @@ def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
     print(f"✓ Completato: etf_enriched.csv ({len(df)} ETF, {failed} senza prezzo)")
     return df
 
+
+# ── Risk free ────────────────────────────────────
+
+def get_risk_free():
+    """Prova Euribor 3m, fallback T-Bill USA, fallback hardcoded."""
+    for ticker_str, label in [("^EURIBOR3M", "Euribor 3m"), ("^IRX", "T-Bill USA 13w")]:
+        try:
+            rate = yf.Ticker(ticker_str).fast_info.last_price / 100
+            if rate and 0 < rate < 0.15:
+                print(f"[INFO] Risk free ({label}): {rate:.2%}")
+                return rate
+        except Exception:
+            continue
+    print("[INFO] Risk free fallback: 2.5%")
+    return 0.025
+
+
 # ── Analisi ──────────────────────────────────────
 
-def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE00B4L5Y983"):
+def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin="IE00B4L5Y983"):
+
+    if risk_free is None:
+        risk_free = get_risk_free()
+    else:
+        print(f"[INFO] Risk free manuale: {risk_free:.2%}")
+
     risultati = []
 
-    print(f"[DEBUG] Righe storico: {len(df_storico)}")
-    print(f"[DEBUG] ISIN unici: {df_storico['ISIN'].nunique()}")
-
-    # ✅ Filtro adattivo basato sui dati reali
     righe_per_etf = df_storico.groupby("ISIN").size()
     mediana = righe_per_etf.median()
     min_righe = max(10, int(mediana * 0.5))
-    print(f"[DEBUG] Mediana righe per ETF: {mediana} — filtro minimo: {min_righe}")
 
     print("[INFO] Attendo 10s per evitare rate limit...")
     time.sleep(10)
 
     print(f"[INFO] Scarico benchmark {benchmark_isin}...")
     try:
-        bench = yf.Ticker(benchmark_isin).history(period="2y", auto_adjust=True)  # ✅ niente session
+        bench = yf.Ticker(f"{benchmark_isin}.MI").history(period="2y", auto_adjust=True)
         bench_ret = bench["Close"].ffill().pct_change(fill_method=None).dropna()
-        print(f"[DEBUG] Benchmark righe: {len(bench_ret)}")
+        print(f"[INFO] Benchmark: {len(bench_ret)} righe")
     except Exception as e:
         print(f"[WARN] Benchmark non disponibile: {e}")
         bench_ret = None
@@ -494,7 +509,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
 
     for isin, gruppo in df_storico.groupby("ISIN"):
         close = gruppo["Close"].sort_index().dropna()
-        if len(close) < min_righe:  # ✅ filtro adattivo
+        if len(close) < min_righe:
             continue
 
         rendimenti = close.ffill().pct_change(fill_method=None).dropna()
@@ -511,7 +526,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
         if bench_ret is not None:
             try:
                 comune = rendimenti.index.intersection(bench_ret.index)
-                if len(comune) > 5:  # ✅ abbassato da 30 a 5
+                if len(comune) > 5:
                     r = rendimenti.loc[comune]
                     b = bench_ret.loc[comune]
                     cov = np.cov(r, b)
@@ -545,11 +560,10 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
     df_analisi = pd.DataFrame(risultati).sort_values("Sharpe_Ratio", ascending=False)
 
     if df_enriched is not None and "ISIN" in df_enriched.columns:
-        cols = ["ISIN", "Nome"]
-        if "TER" in df_enriched.columns:
-            cols.append("TER")
-        if "SFDR" in df_enriched.columns:
-            cols.append("SFDR")
+        cols = ["ISIN"]
+        for col in ["Nome", "TER", "SFDR"]:
+            if col in df_enriched.columns:
+                cols.append(col)
         df_meta = df_enriched[cols].drop_duplicates(subset="ISIN")
         df_analisi = df_analisi.merge(df_meta, on="ISIN", how="left")
 
@@ -558,6 +572,53 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=0.03, benchmark_isin="IE
     df_analisi.to_csv("analisi_etf.csv", index=False)
     print("\n✓ Salvato in analisi_etf.csv")
     return df_analisi
+
+
+# ── Main helpers ─────────────────────────────────
+
+def scegli_o_scarica_storico(df):
+    storici_salvati = sorted(glob.glob("storico_*.csv"))
+
+    if storici_salvati:
+        print("\nStorici già scaricati:")
+        for i, f in enumerate(storici_salvati):
+            mtime = datetime.fromtimestamp(os.path.getmtime(f))
+            size_kb = os.path.getsize(f) // 1024
+            print(f"  {i+1}. {f}  ({mtime.strftime('%d/%m/%Y %H:%M')}, {size_kb} KB)")
+        print(f"  {len(storici_salvati)+1}. Riprendi download interrotto")
+        print(f"  {len(storici_salvati)+2}. Scarica nuovo storico (sovrascrive)")
+
+        scelta = input(f"\nScegli [1-{len(storici_salvati)+2}]: ").strip()
+
+        try:
+            idx = int(scelta) - 1
+
+            # Carica storico esistente
+            if 0 <= idx < len(storici_salvati):
+                print(f"[INFO] Carico {storici_salvati[idx]}...")
+                df_storico = pd.read_csv(storici_salvati[idx], index_col=0, parse_dates=True)
+                print(f"✓ Caricato: {df_storico['ISIN'].nunique()} ETF, {len(df_storico)} righe")
+                return df_storico
+
+            # Riprendi da checkpoint
+            elif idx == len(storici_salvati):
+                period = input("Periodo da riprendere (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+                return download_storico(df, period=period)
+
+            # Scarica da zero — cancella checkpoint prima
+            elif idx == len(storici_salvati) + 1:
+                period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+                checkpoint_file = f"storico_{period}.csv"
+                if os.path.exists(checkpoint_file):
+                    os.remove(checkpoint_file)
+                    print("[INFO] Checkpoint rimosso — ricomincio da zero")
+                return download_storico(df, period=period)
+
+        except (ValueError, IndexError):
+            pass
+
+    period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+    return download_storico(df, period=period)
 
 
 # ── Main ─────────────────────────────────────────
@@ -575,11 +636,7 @@ if choice == '1':
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
         if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-            period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
-            if period == "1d":
-                print("[WARN] '1d' restituisce 1 sola riga — uso 6mo")
-                period = "6mo"
-            df_storico = download_storico(df, period=period)
+            df_storico = scegli_o_scarica_storico(df)
             if not df_storico.empty:
                 if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
                     analisi_etf(df_storico, df_enriched=df)
@@ -591,11 +648,7 @@ elif choice == '2':
         if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
             df = enrich_with_yfinance(df)
         if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-            period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
-            if period == "1d":
-                print("[WARN] '1d' restituisce 1 sola riga — uso 6mo")
-                period = "6mo"
-            df_storico = download_storico(df, period=period)
+            df_storico = scegli_o_scarica_storico(df)
             if not df_storico.empty:
                 if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
                     analisi_etf(df_storico, df_enriched=df)
