@@ -16,43 +16,44 @@ from datetime import datetime
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURAZIONE GLOBALE
+# ═══════════════════════════════════════════════════════════════
 
-# ── Flag stop ────────────────────────────────────
+CONFIG = {
+    "scraping_workers":    5,
+    "enrich_workers":      4,
+    "enrich_batch_size":   30,
+    "enrich_batch_pause":  3.0,
+    "storico_workers":     2,
+    "storico_batch_size":  20,
+    "storico_batch_pause": 8.0,
+    "default_period":      "6mo",
+    "benchmark_isin":      "IE00B4L5Y983",
+}
+
 stop_flag = False
 
 def handle_sigint(sig, frame):
     global stop_flag
-    print("\n[INFO] CTRL+C — stop dopo questa pagina...")
+    print("\n[INFO] CTRL+C ricevuto — stop al prossimo checkpoint...")
     stop_flag = True
 
 signal.signal(signal.SIGINT, handle_sigint)
 
 
-# ── Playwright helpers ───────────────────────────
-
-def goto_with_retry(page, url, retries=3, wait=5000):
-    for attempt in range(retries):
-        try:
-            page.goto(url, timeout=30000)
-            return True
-        except Exception as e:
-            if "ERR_ABORTED" in str(e) and attempt < retries - 1:
-                print(f"    [WARN] ERR_ABORTED — riprovo tra {wait//1000}s ({attempt+1}/{retries})...")
-                page.wait_for_timeout(wait)
-            else:
-                raise
-    return False
-
+# ═══════════════════════════════════════════════════════════════
+#  PLAYWRIGHT HELPERS
+# ═══════════════════════════════════════════════════════════════
 
 def accept_cookies(page):
     try:
-        accept_btn = page.locator(
+        btn = page.locator(
             "button:has-text('Accept'), button:has-text('Accetta'), "
-            "button:has-text('Accetto'), #ccc-notify-accept, "
-            "button.ccc-accept-button"
+            "button:has-text('Accetto'), #ccc-notify-accept, button.ccc-accept-button"
         ).first
-        if accept_btn.is_visible():
-            accept_btn.click()
+        if btn.is_visible():
+            btn.click()
             page.wait_for_timeout(1000)
             print("[INFO] Banner cookie chiuso.")
     except Exception:
@@ -61,28 +62,23 @@ def accept_cookies(page):
 
 def extract_isin_from_href(href):
     try:
-        filename = href.split("/")[-1]
-        isin = filename.split("-")[0]
+        isin = href.split("/")[-1].split("-")[0]
         return isin if len(isin) == 12 else None
     except Exception:
         return None
 
 
-# ── Scraping helpers ─────────────────────────────
-
 def scrape_page(page_num, base_url, sfdr_label=None):
+    """Scrapa una singola pagina — ogni thread ha il suo browser."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         try:
-            url = base_url.format(page_num)
-            page.goto(url, timeout=30000)
+            page.goto(base_url.format(page_num), timeout=30000)
             page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
 
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(page.content(), "html.parser")
             table = soup.find("table")
-
             if not table:
                 return []
 
@@ -102,13 +98,14 @@ def scrape_page(page_num, base_url, sfdr_label=None):
             return rows
 
         except Exception as e:
-            print(f"    [WARN] Pagina {page_num} errore: {e}")
+            print(f"    [WARN] Pagina {page_num}: {e}")
             return []
         finally:
             browser.close()
 
 
 def find_last_page(base_url):
+    """Trova l'ultima pagina disponibile con verifica."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -122,54 +119,50 @@ def find_last_page(base_url):
             page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
             page.wait_for_timeout(3000)
 
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-
+            soup = BeautifulSoup(page.content(), "html.parser")
             max_page = 1
+
             for link in soup.find_all("a", href=True):
-                href = link.get("href", "")
-                if "page=" in href:
+                if "page=" in link.get("href", ""):
                     try:
-                        n = int(href.split("page=")[-1].split("'")[0].strip())
+                        n = int(link["href"].split("page=")[-1].split("'")[0].strip())
                         max_page = max(max_page, n)
                     except Exception:
                         pass
+
             for a in soup.find_all("a"):
-                txt = a.get_text(strip=True)
-                if txt.isdigit():
-                    max_page = max(max_page, int(txt))
+                if a.get_text(strip=True).isdigit():
+                    max_page = max(max_page, int(a.get_text(strip=True)))
 
             print(f"[INFO] Ultima pagina trovata: {max_page}")
 
-            test_url = base_url.format(max_page + 10)
-            page.goto(test_url, timeout=15000)
+            # Verifica se ci sono più pagine
+            page.goto(base_url.format(max_page + 10), timeout=15000)
             page.wait_for_timeout(2000)
-            html_test = page.content()
-            soup_test = BeautifulSoup(html_test, "html.parser")
+            soup_test = BeautifulSoup(page.content(), "html.parser")
             table_test = soup_test.find("table")
-            rows_test = table_test.find_all("tr")[1:] if table_test else []
-            if rows_test:
+            if table_test and table_test.find_all("tr")[1:]:
                 print(f"[INFO] Ci sono più di {max_page} pagine — uso fallback 500")
                 return 500
 
             return max_page
 
         except Exception as e:
-            print(f"[WARN] find_last_page errore: {e} — uso fallback 500")
+            print(f"[WARN] find_last_page: {e} — fallback 500")
             return 500
         finally:
             browser.close()
 
 
 def get_headers(base_url, sfdr_label=None):
+    """Recupera gli header della tabella."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         try:
             page.goto(base_url.format(1), timeout=30000)
             page.wait_for_selector("table", timeout=15000)
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
+            soup = BeautifulSoup(page.content(), "html.parser")
             table = soup.find("table")
             headers = [th.get_text(strip=True) for th in table.find_all("th")]
             headers.append("Link")
@@ -182,16 +175,15 @@ def get_headers(base_url, sfdr_label=None):
             browser.close()
 
 
-# ── Search functions ─────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  SCRAPING ETF
+# ═══════════════════════════════════════════════════════════════
 
-def search_deep_fast(workers=5):
-    global stop_flag
-    stop_flag = False
-
-    base_url = "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=&lang=it&page={}"
-
+def _scrapa_url(base_url, sfdr_label=None, workers=5):
+    """Logica comune di scraping per qualsiasi URL."""
     last_page = find_last_page(base_url)
-    print(f"[INFO] Scraping max {last_page} pagine con {workers} thread... (CTRL+C per fermare)")
+    label = sfdr_label or "tutti gli ETF"
+    print(f"\n[INFO] Scraping {label} — max {last_page} pagine con {workers} thread...")
 
     all_rows = []
     page_num = 1
@@ -201,7 +193,7 @@ def search_deep_fast(workers=5):
         block_rows = []
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(scrape_page, n, base_url): n for n in block}
+            futures = {executor.submit(scrape_page, n, base_url, sfdr_label): n for n in block}
             for future in as_completed(futures):
                 if stop_flag:
                     executor.shutdown(wait=False, cancel_futures=True)
@@ -213,74 +205,72 @@ def search_deep_fast(workers=5):
         all_rows.extend(block_rows)
         print(f"    → pagine {page_num}-{block[-1]}: {len(block_rows)} righe | totale: {len(all_rows)}")
 
-        if len(block_rows) == 0:
-            print("[INFO] Blocco vuoto — fine scraping.")
+        if not block_rows:
+            print(f"    [INFO] Blocco vuoto — fine {label}.")
             break
 
         page_num += 20
 
+    return all_rows
+
+
+def search_deep_fast(workers=None):
+    global stop_flag
+    stop_flag = False
+    workers = workers or CONFIG["scraping_workers"]
+
+    base_url = (
+        "https://www.borsaitaliana.it/borsa/etf/search.html"
+        "?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark="
+        "&sectorization=&lang=it&page={}"
+    )
+
+    all_rows = _scrapa_url(base_url, workers=workers)
+
     if not all_rows:
-        print("[WARNING] No rows collected.")
+        print("[WARNING] Nessuna riga raccolta.")
         return pd.DataFrame()
 
-    headers_row = get_headers(base_url)
+    headers = get_headers(base_url)
     df = pd.DataFrame(
         all_rows,
-        columns=headers_row[:len(all_rows[0])] if headers_row else None
+        columns=headers[:len(all_rows[0])] if headers else None
     ).drop_duplicates()
 
-    print(f"✓ Totale ETF raccolti: {len(df)}")
+    print(f"\n✓ Totale ETF raccolti: {len(df)}")
     df.to_csv("etf_borsa_italiana.csv", index=False)
     print("✓ Salvato in etf_borsa_italiana.csv")
     return df
 
 
-def search_greendeep_fast(workers=5):
+def search_greendeep_fast(workers=None):
     global stop_flag
     stop_flag = False
+    workers = workers or CONFIG["scraping_workers"]
 
-    urls = [
-        ("Art. 8", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%208&lang=it&page={}"),
-        ("Art. 9", "https://www.borsaitaliana.it/borsa/etf/search.html?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark=&sectorization=ESG%20ETF%20ART.%209&lang=it&page={}"),
+    sfdr_urls = [
+        ("Art. 8", (
+            "https://www.borsaitaliana.it/borsa/etf/search.html"
+            "?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark="
+            "&sectorization=ESG%20ETF%20ART.%208&lang=it&page={}"
+        )),
+        ("Art. 9", (
+            "https://www.borsaitaliana.it/borsa/etf/search.html"
+            "?comparto=ETF&idBenchmarkStyle=&idBenchmark=&indexBenchmark="
+            "&sectorization=ESG%20ETF%20ART.%209&lang=it&page={}"
+        )),
     ]
 
     all_rows = []
-    headers_row = None
+    headers = None
 
-    for sfdr_label, base_url in urls:
+    for sfdr_label, base_url in sfdr_urls:
         if stop_flag:
             break
-
-        last_page = find_last_page(base_url)
-        print(f"\n[INFO] Scraping {sfdr_label} — max {last_page} pagine con {workers} thread...")
-
-        page_num = 1
-
-        while not stop_flag and page_num <= last_page:
-            block = list(range(page_num, min(page_num + 20, last_page + 1)))
-            block_rows = []
-
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(scrape_page, n, base_url, sfdr_label): n for n in block}
-                for future in as_completed(futures):
-                    if stop_flag:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    rows = future.result()
-                    if rows:
-                        block_rows.extend(rows)
-
-            all_rows.extend(block_rows)
-            print(f"    → pagine {page_num}-{block[-1]}: {len(block_rows)} righe | totale: {len(all_rows)}")
-
-            if len(block_rows) == 0:
-                print(f"    [INFO] Blocco vuoto — fine {sfdr_label}.")
-                break
-
-            page_num += 20
-
-        if headers_row is None:
-            headers_row = get_headers(base_url, sfdr_label)
+        rows = _scrapa_url(base_url, sfdr_label=sfdr_label, workers=workers)
+        all_rows.extend(rows)
+        if headers is None:
+            headers = get_headers(base_url, sfdr_label)
 
     if not all_rows:
         print("[WARNING] Nessun ETF trovato.")
@@ -288,25 +278,26 @@ def search_greendeep_fast(workers=5):
 
     df = pd.DataFrame(
         all_rows,
-        columns=headers_row[:len(all_rows[0])] if headers_row else None
+        columns=headers[:len(all_rows[0])] if headers else None
     ).drop_duplicates()
 
     print(f"\n✓ Totale ETF SFDR raccolti: {len(df)}")
-    print(df['SFDR'].value_counts())
+    print(df["SFDR"].value_counts().to_string())
     df.to_csv("etf_sfdr.csv", index=False)
     print("✓ Salvato in etf_sfdr.csv")
     return df
 
 
-# ── yfinance functions ───────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  YFINANCE
+# ═══════════════════════════════════════════════════════════════
 
-def isin_to_tickers(isin):
-    """Borsa Italiana ETFs resolve better with .MI suffix on Yahoo Finance."""
+def _ticker_variants(isin):
     return [f"{isin}.MI", isin]
 
 
 def fetch_price(isin):
-    for ticker_str in isin_to_tickers(isin):
+    for ticker_str in _ticker_variants(isin):
         try:
             price = yf.Ticker(ticker_str).fast_info.last_price
             if price and price > 0:
@@ -317,31 +308,87 @@ def fetch_price(isin):
 
 
 def fetch_storico(isin, period, max_retries=4):
-    for ticker_str in isin_to_tickers(isin):
+    for ticker_str in _ticker_variants(isin):
         for attempt in range(max_retries):
             try:
                 storico = yf.Ticker(ticker_str).history(period=period, auto_adjust=True)
                 if not storico.empty:
                     storico["ISIN"] = isin
                     return isin, storico
-                break  # empty, no error → wrong ticker format, try next
+                break
             except Exception as e:
                 msg = str(e)
                 if "Invalid ISIN" in msg:
-                    break  # bare ISIN rejected → skip to .MI
+                    break
                 if "Too Many Requests" in msg or "rate limit" in msg.lower():
                     if attempt < max_retries - 1:
                         wait = (2 ** (attempt + 1)) + random.uniform(0, 1.5)
                         time.sleep(wait)
                         continue
-                print(f"[WARN] {ticker_str}: {e}")
                 break
     return isin, None
 
 
-def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=8.0):
+def enrich_with_yfinance(df,
+                          workers=None,
+                          batch_size=None,
+                          batch_pause=None):
     global stop_flag
     stop_flag = False
+    workers     = workers     or CONFIG["enrich_workers"]
+    batch_size  = batch_size  or CONFIG["enrich_batch_size"]
+    batch_pause = batch_pause or CONFIG["enrich_batch_pause"]
+
+    df = df.copy()
+    df["ISIN"] = df["Link"].apply(extract_isin_from_href)
+    isins = df["ISIN"].dropna().tolist()
+
+    print(f"[INFO] {len(isins)} ISIN — {workers} workers, batch {batch_size}, pausa {batch_pause}s")
+
+    prices = {}
+    failed = 0
+    n_batches = -(-len(isins) // batch_size)  # ceil
+
+    for batch_idx, batch_start in enumerate(range(0, len(isins), batch_size), 1):
+        if stop_flag:
+            break
+
+        batch = isins[batch_start: batch_start + batch_size]
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_price, isin): isin for isin in batch}
+            for future in as_completed(futures):
+                if stop_flag:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                isin, price = future.result()
+                prices[isin] = price
+                if price is None:
+                    failed += 1
+
+        df["YF_Price"] = df["ISIN"].map(prices)
+        df.to_csv("etf_enriched.csv", index=False)
+        print(f"    batch {batch_idx}/{n_batches} — "
+              f"{len(prices)}/{len(isins)} completati | {failed} senza prezzo | salvato ✓")
+
+        if batch_start + batch_size < len(isins) and not stop_flag:
+            time.sleep(batch_pause)
+
+    print(f"\n✓ etf_enriched.csv — {len(df)} ETF, {failed} senza prezzo")
+    return df
+
+
+def download_storico(df,
+                      period=None,
+                      workers=None,
+                      batch_size=None,
+                      batch_pause=None):
+    global stop_flag
+    stop_flag = False
+    period      = period      or CONFIG["default_period"]
+    workers     = workers     or CONFIG["storico_workers"]
+    batch_size  = batch_size  or CONFIG["storico_batch_size"]
+    batch_pause = batch_pause or CONFIG["storico_batch_pause"]
 
     if "ISIN" not in df.columns:
         df = df.copy()
@@ -350,38 +397,36 @@ def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=8.0
     isins = df["ISIN"].dropna().tolist()
     checkpoint_file = f"storico_{period}.csv"
 
-    # ── Carica checkpoint se esiste ───────────────────────────────────
+    # ── Checkpoint ───────────────────────────────────────────────
     all_storico = {}
     if os.path.exists(checkpoint_file):
         try:
-            df_checkpoint = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
-            if "ISIN" in df_checkpoint.columns and not df_checkpoint.empty:
-                for isin, gruppo in df_checkpoint.groupby("ISIN"):
-                    all_storico[isin] = gruppo
-                isins_rimanenti = [i for i in isins if i not in all_storico]
-                print(f"[INFO] Checkpoint trovato: {len(all_storico)} già scaricati, "
-                      f"{len(isins_rimanenti)} rimanenti")
-                isins = isins_rimanenti
-            else:
-                print("[INFO] Checkpoint vuoto o malformato — ricomincio da zero")
+            df_cp = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
+            if "ISIN" in df_cp.columns and not df_cp.empty:
+                for isin, g in df_cp.groupby("ISIN"):
+                    all_storico[isin] = g
+                isins = [i for i in isins if i not in all_storico]
+                print(f"[INFO] Checkpoint: {len(all_storico)} già scaricati, {len(isins)} rimanenti")
         except Exception as e:
-            print(f"[WARN] Checkpoint non leggibile ({e}) — ricomincio da zero")
+            print(f"[WARN] Checkpoint non leggibile ({e}) — ricomincio")
 
     if not isins:
-        print("[INFO] Tutti gli ETF già scaricati nel checkpoint.")
+        print("[INFO] Tutti gli ETF già nel checkpoint.")
         return pd.concat(all_storico.values())
 
-    print(f"[INFO] Download storico {period} — {len(isins)} ISINs, {workers} workers, "
-          f"batch {batch_size}, pausa {batch_pause}s...")
+    n_batches = -(-len(isins) // batch_size)
+    print(f"[INFO] Download {period} — {len(isins)} ISINs, {workers} workers, "
+          f"batch {batch_size}, pausa {batch_pause}s")
+
     failed = 0
 
     with tqdm(total=len(isins), unit="ETF", ncols=80, colour="green") as pbar:
-        for batch_start in range(0, len(isins), batch_size):
+        for batch_idx, batch_start in enumerate(range(0, len(isins), batch_size), 1):
             if stop_flag:
-                print("\n[INFO] Stop — salvo checkpoint parziale.")
+                print("\n[INFO] Stop — salvo checkpoint.")
                 break
 
-            batch = isins[batch_start : batch_start + batch_size]
+            batch = isins[batch_start: batch_start + batch_size]
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(fetch_storico, isin, period): isin for isin in batch}
@@ -395,13 +440,9 @@ def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=8.0
                     else:
                         failed += 1
                     pbar.update(1)
-                    pbar.set_postfix({
-                        "ok": len(all_storico),
-                        "fail": failed,
-                        "batch": f"{batch_start//batch_size + 1}/{-(-len(isins)//batch_size)}"
-                    })
+                    pbar.set_postfix(ok=len(all_storico), fail=failed,
+                                     batch=f"{batch_idx}/{n_batches}")
 
-            # ── Salva checkpoint dopo ogni batch ─────────────────────
             if all_storico:
                 pd.concat(all_storico.values()).to_csv(checkpoint_file)
 
@@ -414,59 +455,15 @@ def download_storico(df, period="6mo", workers=2, batch_size=20, batch_pause=8.0
 
     df_storico = pd.concat(all_storico.values())
     df_storico.to_csv(checkpoint_file)
-    print(f"✓ Salvato in {checkpoint_file} ({len(all_storico)} ETF, {failed} falliti)")
+    print(f"\n✓ {checkpoint_file} — {len(all_storico)} ETF, {failed} falliti")
     return df_storico
 
 
-def enrich_with_yfinance(df, workers=4, batch_size=30, batch_pause=3.0):
-    global stop_flag
-    stop_flag = False
-
-    df = df.copy()
-    df["ISIN"] = df["Link"].apply(extract_isin_from_href)
-    isins_validi = df["ISIN"].dropna().tolist()
-
-    print(f"[INFO] {len(isins_validi)} ISIN trovati su {len(df)} ETF")
-    print(f"[INFO] Download prezzi con {workers} workers, batch {batch_size}...")
-
-    prices = {}
-    completati = 0
-    failed = 0
-
-    for batch_start in range(0, len(isins_validi), batch_size):
-        if stop_flag:
-            break
-
-        batch = isins_validi[batch_start : batch_start + batch_size]
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(fetch_price, isin): isin for isin in batch}
-            for future in as_completed(futures):
-                if stop_flag:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                isin, price = future.result()
-                prices[isin] = price
-                if price is None:
-                    failed += 1
-                completati += 1
-
-        # ── Salva una volta per batch ─────────────────────────────────
-        df["YF_Price"] = df["ISIN"].map(prices)
-        df.to_csv("etf_enriched.csv", index=False)
-        print(f"    → {completati}/{len(isins_validi)} completati | falliti: {failed} | salvato")
-
-        if batch_start + batch_size < len(isins_validi) and not stop_flag:
-            time.sleep(batch_pause)
-
-    print(f"✓ Completato: etf_enriched.csv ({len(df)} ETF, {failed} senza prezzo)")
-    return df
-
-
-# ── Risk free ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  ANALISI
+# ═══════════════════════════════════════════════════════════════
 
 def get_risk_free():
-    """Prova Euribor 3m, fallback T-Bill USA, fallback hardcoded."""
     for ticker_str, label in [("^EURIBOR3M", "Euribor 3m"), ("^IRX", "T-Bill USA 13w")]:
         try:
             rate = yf.Ticker(ticker_str).fast_info.last_price / 100
@@ -479,188 +476,184 @@ def get_risk_free():
     return 0.025
 
 
-# ── Analisi ──────────────────────────────────────
+def analisi_etf(df_storico, df_enriched=None, risk_free=None,
+                benchmark_isin=None):
 
-def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin="IE00B4L5Y983"):
-
-    if risk_free is None:
-        risk_free = get_risk_free()
-    else:
-        print(f"[INFO] Risk free manuale: {risk_free:.2%}")
+    benchmark_isin = benchmark_isin or CONFIG["benchmark_isin"]
+    risk_free      = risk_free      or get_risk_free()
 
     risultati = []
-
     righe_per_etf = df_storico.groupby("ISIN").size()
-    mediana = righe_per_etf.median()
+    mediana   = righe_per_etf.median()
     min_righe = max(10, int(mediana * 0.5))
 
-    print("[INFO] Attendo 10s per evitare rate limit...")
-    time.sleep(10)
+    print(f"[INFO] {df_storico['ISIN'].nunique()} ETF | "
+          f"mediana righe: {mediana:.0f} | filtro min: {min_righe}")
 
-    # ── Benchmark con retry ───────────────────────────────────────────
-    print(f"[INFO] Scarico benchmark {benchmark_isin}...")
+    # ── Benchmark con retry ───────────────────────────────────────
+    print(f"\n[INFO] Scarico benchmark {benchmark_isin}...")
+    time.sleep(10)
     bench_ret = None
     for attempt in range(3):
         try:
             bench = yf.Ticker(f"{benchmark_isin}.MI").history(period="2y", auto_adjust=True)
             if not bench.empty:
                 bench_ret = bench["Close"].ffill().pct_change(fill_method=None).dropna()
-                print(f"[INFO] Benchmark: {len(bench_ret)} righe")
+                print(f"[INFO] Benchmark: {len(bench_ret)} righe ✓")
                 break
-        except Exception as e:
+        except Exception:
             wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
-            print(f"[WARN] Benchmark tentativo {attempt+1}/3 fallito — riprovo tra {wait:.0f}s")
+            print(f"[WARN] Benchmark tentativo {attempt+1}/3 — riprovo tra {wait:.0f}s")
             time.sleep(wait)
-    if bench_ret is None:
-        print("[WARN] Benchmark non disponibile — Beta e Alpha saranno NaN")
 
-    print(f"[INFO] Calcolo metriche per {df_storico['ISIN'].nunique()} ETF...")
+    if bench_ret is None:
+        print("[WARN] Benchmark non disponibile — Beta/Alpha saranno NaN")
+
+    # ── Calcolo metriche ─────────────────────────────────────────
+    print(f"[INFO] Calcolo metriche...\n")
 
     for isin, gruppo in df_storico.groupby("ISIN"):
         close = gruppo["Close"].sort_index().dropna()
         if len(close) < min_righe:
             continue
 
-        rendimenti = close.ffill().pct_change(fill_method=None).dropna()
-        rendimento_annuo = rendimenti.mean() * 252
-        volatilita_annua = rendimenti.std() * np.sqrt(252)
-        sharpe = (rendimento_annuo - risk_free) / volatilita_annua if volatilita_annua > 0 else None
+        ret = close.ffill().pct_change(fill_method=None).dropna()
+        rend_annuo  = ret.mean() * 252
+        vol_annua   = ret.std()  * np.sqrt(252)
+        sharpe      = (rend_annuo - risk_free) / vol_annua if vol_annua > 0 else None
+        max_dd      = ((close - close.cummax()) / close.cummax()).min()
 
-        rolling_max = close.cummax()
-        drawdown = (close - rolling_max) / rolling_max
-        max_drawdown = drawdown.min()
-
-        beta = None
-        alpha = None
+        beta = alpha = None
         if bench_ret is not None:
             try:
-                comune = rendimenti.index.intersection(bench_ret.index)
+                comune = ret.index.intersection(bench_ret.index)
                 if len(comune) > 5:
-                    r = rendimenti.loc[comune]
-                    b = bench_ret.loc[comune]
-                    cov = np.cov(r, b)
+                    r, b = ret.loc[comune], bench_ret.loc[comune]
+                    cov  = np.cov(r, b)
                     beta = cov[0, 1] / cov[1, 1]
-                    alpha = (rendimento_annuo - risk_free) - beta * (b.mean() * 252 - risk_free)
+                    alpha = (rend_annuo - risk_free) - beta * (b.mean() * 252 - risk_free)
             except Exception:
                 pass
 
-        def perf(giorni):
-            if len(close) >= giorni:
-                return (close.iloc[-1] / close.iloc[-giorni] - 1) * 100
-            return None
+        def perf(gg):
+            return round((close.iloc[-1] / close.iloc[-gg] - 1) * 100, 2) if len(close) >= gg else None
 
         risultati.append({
             "ISIN":              isin,
-            "Rendimento_annuo%": round(rendimento_annuo * 100, 2),
-            "Volatilita_annua%": round(volatilita_annua * 100, 2),
-            "Sharpe_Ratio":      round(sharpe, 3) if sharpe else None,
-            "Max_Drawdown%":     round(max_drawdown * 100, 2),
-            "Beta":              round(beta, 3) if beta else None,
-            "Alpha%":            round(alpha * 100, 3) if alpha else None,
-            "Perf_1mese%":       round(perf(21), 2) if perf(21) else None,
-            "Perf_6mesi%":       round(perf(126), 2) if perf(126) else None,
-            "Perf_1anno%":       round(perf(252), 2) if perf(252) else None,
+            "Rendimento_annuo%": round(rend_annuo * 100, 2),
+            "Volatilita_annua%": round(vol_annua  * 100, 2),
+            "Sharpe_Ratio":      round(sharpe, 3)       if sharpe is not None else None,
+            "Max_Drawdown%":     round(max_dd   * 100, 2),
+            "Beta":              round(beta,  3)        if beta   is not None else None,
+            "Alpha%":            round(alpha * 100, 3)  if alpha  is not None else None,
+            "Perf_1mese%":       perf(21),
+            "Perf_6mesi%":       perf(126),
+            "Perf_1anno%":       perf(252),
         })
 
     if not risultati:
-        print("[WARNING] Nessun ETF ha superato il filtro minimo.")
+        print("[WARNING] Nessun ETF ha superato il filtro.")
         return pd.DataFrame()
 
     df_analisi = pd.DataFrame(risultati).sort_values("Sharpe_Ratio", ascending=False)
 
+    # ── Merge con metadati ────────────────────────────────────────
     if df_enriched is not None and "ISIN" in df_enriched.columns:
-        cols = ["ISIN"]
-        for col in ["Nome", "TER", "SFDR"]:
-            if col in df_enriched.columns:
-                cols.append(col)
-        df_meta = df_enriched[cols].drop_duplicates(subset="ISIN")
-        df_analisi = df_analisi.merge(df_meta, on="ISIN", how="left")
+        meta_cols = ["ISIN"] + [c for c in ["Nome", "TER", "SFDR"] if c in df_enriched.columns]
+        df_analisi = df_analisi.merge(
+            df_enriched[meta_cols].drop_duplicates("ISIN"),
+            on="ISIN", how="left"
+        )
 
-    print("\n── TOP 10 per Sharpe Ratio ──────────────────")
+    print("── TOP 10 per Sharpe Ratio ──────────────────")
     print(df_analisi.head(10).to_string(index=False))
     df_analisi.to_csv("analisi_etf.csv", index=False)
     print("\n✓ Salvato in analisi_etf.csv")
     return df_analisi
 
 
-# ── Main helpers ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  STORICO — SELEZIONE INTERATTIVA
+# ═══════════════════════════════════════════════════════════════
 
 def scegli_o_scarica_storico(df):
-    storici_salvati = sorted(glob.glob("storico_*.csv"))
+    storici = sorted(glob.glob("storico_*.csv"))
 
-    if storici_salvati:
-        print("\nStorici già scaricati:")
-        for i, f in enumerate(storici_salvati):
-            mtime = datetime.fromtimestamp(os.path.getmtime(f))
+    if storici:
+        print("\n── Storici disponibili ──────────────────────")
+        for i, f in enumerate(storici, 1):
+            mtime   = datetime.fromtimestamp(os.path.getmtime(f)).strftime("%d/%m/%Y %H:%M")
             size_kb = os.path.getsize(f) // 1024
-            print(f"  {i+1}. {f}  ({mtime.strftime('%d/%m/%Y %H:%M')}, {size_kb} KB)")
-        print(f"  {len(storici_salvati)+1}. Riprendi download interrotto")
-        print(f"  {len(storici_salvati)+2}. Scarica nuovo storico (sovrascrive)")
+            print(f"  {i}. {f}  ({mtime}, {size_kb} KB)")
+        n = len(storici)
+        print(f"  {n+1}. Riprendi download interrotto")
+        print(f"  {n+2}. Scarica nuovo (sovrascrive checkpoint)")
+        print("─────────────────────────────────────────────")
 
-        scelta = input(f"\nScegli [1-{len(storici_salvati)+2}]: ").strip()
-
+        scelta = input(f"Scegli [1-{n+2}]: ").strip()
         try:
             idx = int(scelta) - 1
-
-            # Carica storico esistente
-            if 0 <= idx < len(storici_salvati):
-                print(f"[INFO] Carico {storici_salvati[idx]}...")
-                df_storico = pd.read_csv(storici_salvati[idx], index_col=0, parse_dates=True)
-                print(f"✓ Caricato: {df_storico['ISIN'].nunique()} ETF, {len(df_storico)} righe")
-                return df_storico
-
-            # Riprendi da checkpoint
-            elif idx == len(storici_salvati):
-                period = input("Periodo da riprendere (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+            if 0 <= idx < n:
+                print(f"[INFO] Carico {storici[idx]}...")
+                df_s = pd.read_csv(storici[idx], index_col=0, parse_dates=True)
+                print(f"✓ {df_s['ISIN'].nunique()} ETF, {len(df_s)} righe")
+                return df_s
+            elif idx == n:
+                period = input(f"Periodo da riprendere [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
                 return download_storico(df, period=period)
-
-            # Scarica da zero — cancella checkpoint prima
-            elif idx == len(storici_salvati) + 1:
-                period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
-                checkpoint_file = f"storico_{period}.csv"
-                if os.path.exists(checkpoint_file):
-                    os.remove(checkpoint_file)
+            elif idx == n + 1:
+                period = input(f"Periodo [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
+                cp = f"storico_{period}.csv"
+                if os.path.exists(cp):
+                    os.remove(cp)
                     print("[INFO] Checkpoint rimosso — ricomincio da zero")
                 return download_storico(df, period=period)
-
         except (ValueError, IndexError):
-            pass
+            print("[WARN] Scelta non valida — scarico nuovo storico")
 
-    period = input("Periodo (1mo/3mo/6mo/1y/2y) [default 6mo]: ").strip() or "6mo"
+    period = input(f"Periodo [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
     return download_storico(df, period=period)
 
 
-# ── Main ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
 
-print("Welcome to the ETF Data Analysis Tool!")
-print("Please choose the type of ETFs you are interested in:")
-print("1. SFDR Legislated ETFs")
-print("2. All ETFs")
-choice = input("Enter the number corresponding to your choice: ")
+def main():
+    print("╔══════════════════════════════════════════════╗")
+    print("║       ETF Data Analysis Tool                 ║")
+    print("║       Fonte: Borsa Italiana + yfinance       ║")
+    print("╚══════════════════════════════════════════════╝\n")
 
-if choice == '1':
-    print("You have chosen to see only SFDR Legislated ETFs compliant with Article 8 (GREEN) or Article 9 (DARK GREEN).")
-    df = search_greendeep_fast(workers=5)
-    if not df.empty:
-        if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
-            df = enrich_with_yfinance(df)
-        if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-            df_storico = scegli_o_scarica_storico(df)
-            if not df_storico.empty:
-                if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
-                    analisi_etf(df_storico, df_enriched=df)
+    print("Tipo di ETF:")
+    print("  1. Solo SFDR Art.8 / Art.9  (Green / Dark Green)")
+    print("  2. Tutti gli ETF")
+    choice = input("\nScelta [1/2]: ").strip()
 
-elif choice == '2':
-    print("You have chosen to see all ETFs.")
-    df = search_deep_fast(workers=5)
-    if not df.empty:
-        if input("Vuoi arricchire con dati yfinance? (y/n): ") == 'y':
-            df = enrich_with_yfinance(df)
-        if input("Vuoi scaricare lo storico prezzi? (y/n): ") == 'y':
-            df_storico = scegli_o_scarica_storico(df)
-            if not df_storico.empty:
-                if input("Vuoi calcolare Sharpe, Drawdown, Beta, Alpha? (y/n): ") == 'y':
-                    analisi_etf(df_storico, df_enriched=df)
+    if choice == "1":
+        print("\n[INFO] SFDR Art.8 + Art.9 selezionati.")
+        df = search_greendeep_fast()
+    elif choice == "2":
+        print("\n[INFO] Tutti gli ETF selezionati.")
+        df = search_deep_fast()
+    else:
+        print("[ERROR] Scelta non valida.")
+        return
 
-else:
-    print("Invalid choice. Please enter 1 or 2.")
+    if df.empty:
+        print("[ERROR] Nessun ETF trovato.")
+        return
+
+    if input("\nArricchire con prezzi yfinance? [y/n]: ").strip().lower() == "y":
+        df = enrich_with_yfinance(df)
+
+    if input("\nScaricare storico prezzi? [y/n]: ").strip().lower() == "y":
+        df_storico = scegli_o_scarica_storico(df)
+
+        if not df_storico.empty:
+            if input("\nCalcolare Sharpe, Drawdown, Beta, Alpha? [y/n]: ").strip().lower() == "y":
+                analisi_etf(df_storico, df_enriched=df)
+
+
+if __name__ == "__main__":
+    main()
