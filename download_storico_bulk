@@ -46,6 +46,18 @@ signal.signal(signal.SIGINT, handle_sigint)
 #  PLAYWRIGHT HELPERS
 # ═══════════════════════════════════════════════════════════════
 
+def _ticker_variants(isin):
+    """Prova più exchange in ordine di probabilità per ETF europei."""
+    return [
+        f"{isin}.MI",   # Milano — funziona per ~610 ETF
+        f"{isin}.DE",   # Xetra Francoforte
+        f"{isin}.PA",   # Euronext Parigi
+        f"{isin}.AS",   # Euronext Amsterdam
+        f"{isin}.L",    # London Stock Exchange
+        f"{isin}.SW",   # SIX Swiss Exchange
+        isin,           # ISIN nudo — ultimo tentativo
+    ]
+
 def accept_cookies(page):
     try:
         btn = page.locator(
@@ -308,6 +320,7 @@ def fetch_price(isin):
 
 
 def fetch_storico(isin, period, max_retries=4):
+    errori = []
     for ticker_str in _ticker_variants(isin):
         for attempt in range(max_retries):
             try:
@@ -315,17 +328,24 @@ def fetch_storico(isin, period, max_retries=4):
                 if not storico.empty:
                     storico["ISIN"] = isin
                     return isin, storico
+                errori.append(f"{ticker_str}: empty")
                 break
             except Exception as e:
                 msg = str(e)
                 if "Invalid ISIN" in msg:
+                    errori.append(f"{ticker_str}: Invalid ISIN")
                     break
                 if "Too Many Requests" in msg or "rate limit" in msg.lower():
                     if attempt < max_retries - 1:
                         wait = (2 ** (attempt + 1)) + random.uniform(0, 1.5)
                         time.sleep(wait)
                         continue
+                errori.append(f"{ticker_str}: {msg[:60]}")
                 break
+
+    # ✅ Stampa solo i primi 20 fallimenti per non spammare
+    if len(errori) > 0:
+        print(f"[FAIL] {isin}: {' | '.join(errori)}")
     return isin, None
 
 
@@ -453,11 +473,68 @@ def download_storico(df,
         print("[WARNING] Nessun storico scaricato.")
         return pd.DataFrame()
 
+    # ✅ Analisi errori
+    errori_tipo = {"rate_limit": 0, "invalid_isin": 0, "empty": 0, "altro": 0}
+
+    # Nel loop sostituisci fetch_storico con una versione che traccia il tipo
+    # Oppure più semplice — dopo il download analizza i falliti:
+
+    falliti = [isin for isin in isins if isin not in all_storico]
+    if falliti:
+        print(f"\n── Analisi {len(falliti)} falliti ──")
+        # Testa i primi 5 manualmente
+        for isin in falliti[:5]:
+            for ticker_str in _ticker_variants(isin):
+                try:
+                    t = yf.Ticker(ticker_str)
+                    storico = t.history(period="5d")
+                    info = t.fast_info
+                    print(f"  {ticker_str}: righe={len(storico)}, exchange={getattr(info, 'exchange', 'N/A')}")
+                except Exception as e:
+                    print(f"  {ticker_str}: ERRORE — {e}")
+
     df_storico = pd.concat(all_storico.values())
     df_storico.to_csv(checkpoint_file)
     print(f"\n✓ {checkpoint_file} — {len(all_storico)} ETF, {failed} falliti")
     return df_storico
 
+def debug_falliti(df, n=10):
+    if "ISIN" not in df.columns:
+        df = df.copy()
+        df["ISIN"] = df["Link"].apply(extract_isin_from_href)
+
+    checkpoint_file = "storico_6mo.csv"
+    scaricati = set()
+    if os.path.exists(checkpoint_file):
+        df_cp = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
+        if "ISIN" in df_cp.columns:
+            scaricati = set(df_cp["ISIN"].unique())
+
+    falliti = [i for i in df["ISIN"].dropna() if i not in scaricati]
+    # ✅ Deduplica — ci sono duplicati nella lista
+    falliti = list(dict.fromkeys(falliti))
+    print(f"Totale falliti unici: {len(falliti)} — testo i primi {n}:\n")
+
+    trovati = 0
+    for isin in falliti[:n]:
+        print(f"── {isin} ──")
+        for ticker_str in _ticker_variants(isin):
+            try:
+                storico = yf.Ticker(ticker_str).history(period="5d", auto_adjust=True)
+                info    = yf.Ticker(ticker_str).fast_info
+                exch    = getattr(info, "exchange", "N/A")
+                curr    = getattr(info, "currency", "N/A")
+                righe   = len(storico)
+                status  = "✅ DATI" if righe > 0 else "❌ empty"
+                print(f"  {ticker_str}: {status} | righe={righe} | exchange={exch} | currency={curr}")
+                if righe > 0:
+                    trovati += 1
+                    break
+            except Exception as e:
+                print(f"  {ticker_str}: ERRORE — {e}")
+        print()
+
+    print(f"Trovati con nuovi suffissi: {trovati}/{min(n, len(falliti))}")
 
 # ═══════════════════════════════════════════════════════════════
 #  ANALISI
@@ -476,8 +553,7 @@ def get_risk_free():
     return 0.025
 
 
-def analisi_etf(df_storico, df_enriched=None, risk_free=None,
-                benchmark_isin=None):
+def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=None):
 
     benchmark_isin = benchmark_isin or CONFIG["benchmark_isin"]
     risk_free      = risk_free      or get_risk_free()
@@ -490,27 +566,30 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None,
     print(f"[INFO] {df_storico['ISIN'].nunique()} ETF | "
           f"mediana righe: {mediana:.0f} | filtro min: {min_righe}")
 
-    # ── Benchmark con retry ───────────────────────────────────────
+    # ── Benchmark — prova più varianti ───────────────────────────
     print(f"\n[INFO] Scarico benchmark {benchmark_isin}...")
     time.sleep(10)
     bench_ret = None
-    for attempt in range(3):
-        try:
-            bench = yf.Ticker(f"{benchmark_isin}.MI").history(period="2y", auto_adjust=True)
-            if not bench.empty:
-                bench_ret = bench["Close"].ffill().pct_change(fill_method=None).dropna()
-                print(f"[INFO] Benchmark: {len(bench_ret)} righe ✓")
-                break
-        except Exception:
-            wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
-            print(f"[WARN] Benchmark tentativo {attempt+1}/3 — riprovo tra {wait:.0f}s")
-            time.sleep(wait)
+    for ticker_str in [benchmark_isin, f"{benchmark_isin}.MI", f"{benchmark_isin}.L"]:
+        for attempt in range(3):
+            try:
+                bench = yf.Ticker(ticker_str).history(period="2y", auto_adjust=True)
+                if not bench.empty:
+                    bench_ret = bench["Close"].ffill().pct_change(fill_method=None).dropna()
+                    print(f"[INFO] Benchmark ({ticker_str}): {len(bench_ret)} righe ✓")
+                    break
+            except Exception:
+                wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
+                time.sleep(wait)
+        if bench_ret is not None:
+            break
 
     if bench_ret is None:
         print("[WARN] Benchmark non disponibile — Beta/Alpha saranno NaN")
 
     # ── Calcolo metriche ─────────────────────────────────────────
-    print(f"[INFO] Calcolo metriche...\n")
+    print("[INFO] Calcolo metriche...\n")
+    outlier_skip = 0
 
     for isin, gruppo in df_storico.groupby("ISIN"):
         close = gruppo["Close"].sort_index().dropna()
@@ -518,10 +597,16 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None,
             continue
 
         ret = close.ffill().pct_change(fill_method=None).dropna()
-        rend_annuo  = ret.mean() * 252
-        vol_annua   = ret.std()  * np.sqrt(252)
-        sharpe      = (rend_annuo - risk_free) / vol_annua if vol_annua > 0 else None
-        max_dd      = ((close - close.cummax()) / close.cummax()).min()
+        rend_annuo = ret.mean() * 252
+        vol_annua  = ret.std()  * np.sqrt(252)
+
+        # ✅ Filtra outlier — dati chiaramente corrotti
+        if abs(rend_annuo) > 5.0 or vol_annua > 2.0:  # >500% rendimento o >200% volatilità
+            outlier_skip += 1
+            continue
+
+        sharpe = (rend_annuo - risk_free) / vol_annua if vol_annua > 0 else None
+        max_dd = ((close - close.cummax()) / close.cummax()).min()
 
         beta = alpha = None
         if bench_ret is not None:
@@ -542,14 +627,17 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None,
             "ISIN":              isin,
             "Rendimento_annuo%": round(rend_annuo * 100, 2),
             "Volatilita_annua%": round(vol_annua  * 100, 2),
-            "Sharpe_Ratio":      round(sharpe, 3)       if sharpe is not None else None,
+            "Sharpe_Ratio":      round(sharpe, 3)      if sharpe is not None else None,
             "Max_Drawdown%":     round(max_dd   * 100, 2),
-            "Beta":              round(beta,  3)        if beta   is not None else None,
-            "Alpha%":            round(alpha * 100, 3)  if alpha  is not None else None,
+            "Beta":              round(beta,  3)       if beta   is not None else None,
+            "Alpha%":            round(alpha * 100, 3) if alpha  is not None else None,
             "Perf_1mese%":       perf(21),
             "Perf_6mesi%":       perf(126),
             "Perf_1anno%":       perf(252),
         })
+
+    if outlier_skip > 0:
+        print(f"[INFO] {outlier_skip} ETF scartati per dati anomali (rendimento >500% o volatilità >200%)")
 
     if not risultati:
         print("[WARNING] Nessun ETF ha superato il filtro.")
@@ -557,7 +645,6 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None,
 
     df_analisi = pd.DataFrame(risultati).sort_values("Sharpe_Ratio", ascending=False)
 
-    # ── Merge con metadati ────────────────────────────────────────
     if df_enriched is not None and "ISIN" in df_enriched.columns:
         meta_cols = ["ISIN"] + [c for c in ["Nome", "TER", "SFDR"] if c in df_enriched.columns]
         df_analisi = df_analisi.merge(
@@ -570,7 +657,6 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None,
     df_analisi.to_csv("analisi_etf.csv", index=False)
     print("\n✓ Salvato in analisi_etf.csv")
     return df_analisi
-
 
 # ═══════════════════════════════════════════════════════════════
 #  STORICO — SELEZIONE INTERATTIVA
@@ -657,3 +743,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+if __name__ == "__main__":
+    # ✅ debug temporaneo — commenta dopo
+    df = pd.read_csv("etf_sfdr.csv")  # o etf_borsa_italiana.csv
+    debug_falliti(df, n=10)
