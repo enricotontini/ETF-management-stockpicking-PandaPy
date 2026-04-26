@@ -24,12 +24,12 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 CONFIG = {
     "scraping_workers":    10,
-    "enrich_workers":      6,
-    "enrich_batch_size":   60,
-    "enrich_batch_pause":  1.0,
-    "storico_workers":     5,
-    "storico_batch_size":  60,
-    "storico_batch_pause": 1.0,
+    "enrich_workers":      4,
+    "enrich_batch_size":   30,
+    "enrich_batch_pause":  3.0,
+    "storico_workers":     2,
+    "storico_batch_size":  20,
+    "storico_batch_pause": 8.0,
     "default_period":      "6mo",
     "benchmark_isin":      "IE00B4L5Y983",
 }
