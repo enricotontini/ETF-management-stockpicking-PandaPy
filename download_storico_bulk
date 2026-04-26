@@ -1,5 +1,6 @@
 import pandas as pd
 import yfinance as yf
+import requests
 from bs4 import BeautifulSoup
 import numpy as np
 import time
@@ -12,7 +13,9 @@ import random
 from tqdm import tqdm
 import glob
 import os
+import json
 from datetime import datetime
+from pathlib import Path
 
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
@@ -21,16 +24,47 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 # ═══════════════════════════════════════════════════════════════
 
 CONFIG = {
-    "scraping_workers":    5,
-    "enrich_workers":      4,
-    "enrich_batch_size":   30,
-    "enrich_batch_pause":  3.0,
-    "storico_workers":     2,
-    "storico_batch_size":  20,
-    "storico_batch_pause": 8.0,
+    "scraping_workers":    10,
+    "enrich_workers":      6,
+    "enrich_batch_size":   60,
+    "enrich_batch_pause":  1.5,
+    "storico_workers":     4,
+    "storico_batch_size":  60,
+    "storico_batch_pause": 1.0,
     "default_period":      "6mo",
     "benchmark_isin":      "IE00B4L5Y983",
 }
+
+# ═══════════════════════════════════════════════════════════════
+#  STRUTTURA CARTELLE
+# ═══════════════════════════════════════════════════════════════
+
+DIRS = {
+    "root":     Path("etf_data"),
+    "raw":      Path("etf_data/01_raw"),          # scraping grezzo
+    "enriched": Path("etf_data/02_enriched"),     # prezzi yfinance
+    "storico":  Path("etf_data/03_storico"),      # serie storiche
+    "analisi":  Path("etf_data/04_analisi"),      # metriche calcolate
+    "cache":    Path("etf_data/cache"),           # exchange cache
+    "log":      Path("etf_data/log"),             # log sessioni
+}
+
+def init_dirs():
+    """Crea tutte le cartelle necessarie se non esistono."""
+    for name, path in DIRS.items():
+        path.mkdir(parents=True, exist_ok=True)
+    print("✓ Struttura cartelle inizializzata:")
+    for name, path in DIRS.items():
+        print(f"    {path}/")
+
+def session_label():
+    """Etichetta univoca per la sessione corrente."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STOP FLAG
+# ═══════════════════════════════════════════════════════════════
 
 stop_flag = False
 
@@ -43,20 +77,54 @@ signal.signal(signal.SIGINT, handle_sigint)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PLAYWRIGHT HELPERS
+#  EXCHANGE CACHE
+# ═══════════════════════════════════════════════════════════════
+
+_exchange_cache = {}
+_CACHE_FILE = DIRS["cache"] / "exchange_cache.json"
+
+def _load_exchange_cache():
+    global _exchange_cache
+    if _CACHE_FILE.exists():
+        with open(_CACHE_FILE) as f:
+            _exchange_cache = json.load(f)
+        print(f"[INFO] Exchange cache: {len(_exchange_cache)} ISIN noti")
+
+def _save_exchange_cache():
+    with open(_CACHE_FILE, "w") as f:
+        json.dump(_exchange_cache, f)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  HELPERS COMUNI
 # ═══════════════════════════════════════════════════════════════
 
 def _ticker_variants(isin):
-    """Prova più exchange in ordine di probabilità per ETF europei."""
     return [
-        f"{isin}.MI",   # Milano — funziona per ~610 ETF
-        f"{isin}.DE",   # Xetra Francoforte
-        f"{isin}.PA",   # Euronext Parigi
-        f"{isin}.AS",   # Euronext Amsterdam
-        f"{isin}.L",    # London Stock Exchange
-        f"{isin}.SW",   # SIX Swiss Exchange
-        isin,           # ISIN nudo — ultimo tentativo
+        f"{isin}.MI",
+        f"{isin}.SG",
+        f"{isin}.DE",
+        f"{isin}.F",
+        f"{isin}.PA",
+        f"{isin}.AS",
+        f"{isin}.L",
+        f"{isin}.SW",
+        f"{isin}.BE",
+        isin,
     ]
+
+
+def extract_isin_from_href(href):
+    try:
+        isin = href.split("/")[-1].split("-")[0]
+        return isin if len(isin) == 12 else None
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PLAYWRIGHT HELPERS
+# ═══════════════════════════════════════════════════════════════
 
 def accept_cookies(page):
     try:
@@ -72,16 +140,7 @@ def accept_cookies(page):
         pass
 
 
-def extract_isin_from_href(href):
-    try:
-        isin = href.split("/")[-1].split("-")[0]
-        return isin if len(isin) == 12 else None
-    except Exception:
-        return None
-
-
 def scrape_page(page_num, base_url, sfdr_label=None):
-    """Scrapa una singola pagina — ogni thread ha il suo browser."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -117,19 +176,18 @@ def scrape_page(page_num, base_url, sfdr_label=None):
 
 
 def find_last_page(base_url):
-    """Trova l'ultima pagina disponibile con verifica."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         try:
             page.goto("https://www.borsaitaliana.it/borsa/etf.html", timeout=30000)
             page.wait_for_load_state("networkidle", timeout=15000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1000)
             accept_cookies(page)
 
             page.goto(base_url.format(1), timeout=30000)
             page.wait_for_selector("table tr:nth-child(2)", timeout=15000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1500)
 
             soup = BeautifulSoup(page.content(), "html.parser")
             max_page = 1
@@ -141,16 +199,14 @@ def find_last_page(base_url):
                         max_page = max(max_page, n)
                     except Exception:
                         pass
-
             for a in soup.find_all("a"):
                 if a.get_text(strip=True).isdigit():
                     max_page = max(max_page, int(a.get_text(strip=True)))
 
             print(f"[INFO] Ultima pagina trovata: {max_page}")
 
-            # Verifica se ci sono più pagine
             page.goto(base_url.format(max_page + 10), timeout=15000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1000)
             soup_test = BeautifulSoup(page.content(), "html.parser")
             table_test = soup_test.find("table")
             if table_test and table_test.find_all("tr")[1:]:
@@ -167,7 +223,6 @@ def find_last_page(base_url):
 
 
 def get_headers(base_url, sfdr_label=None):
-    """Recupera gli header della tabella."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -188,11 +243,10 @@ def get_headers(base_url, sfdr_label=None):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SCRAPING ETF
+#  SCRAPING ETF  →  etf_data/01_raw/
 # ═══════════════════════════════════════════════════════════════
 
 def _scrapa_url(base_url, sfdr_label=None, workers=5):
-    """Logica comune di scraping per qualsiasi URL."""
     last_page = find_last_page(base_url)
     label = sfdr_label or "tutti gli ETF"
     print(f"\n[INFO] Scraping {label} — max {last_page} pagine con {workers} thread...")
@@ -238,7 +292,6 @@ def search_deep_fast(workers=None):
     )
 
     all_rows = _scrapa_url(base_url, workers=workers)
-
     if not all_rows:
         print("[WARNING] Nessuna riga raccolta.")
         return pd.DataFrame()
@@ -249,9 +302,13 @@ def search_deep_fast(workers=None):
         columns=headers[:len(all_rows[0])] if headers else None
     ).drop_duplicates()
 
-    print(f"\n✓ Totale ETF raccolti: {len(df)}")
-    df.to_csv("etf_borsa_italiana.csv", index=False)
-    print("✓ Salvato in etf_borsa_italiana.csv")
+    # ✅ Salva in 01_raw/ con timestamp
+    out = DIRS["raw"] / f"tutti_{session_label()}.csv"
+    df.to_csv(out, index=False)
+    # ✅ Aggiorna anche il "latest" senza timestamp per riferimento rapido
+    df.to_csv(DIRS["raw"] / "tutti_latest.csv", index=False)
+
+    print(f"\n✓ {len(df)} ETF → {out}")
     return df
 
 
@@ -295,18 +352,25 @@ def search_greendeep_fast(workers=None):
 
     print(f"\n✓ Totale ETF SFDR raccolti: {len(df)}")
     print(df["SFDR"].value_counts().to_string())
-    df.to_csv("etf_sfdr.csv", index=False)
-    print("✓ Salvato in etf_sfdr.csv")
+
+    # ✅ Salva per articolo SFDR + file completo
+    out = DIRS["raw"] / f"sfdr_{session_label()}.csv"
+    df.to_csv(out, index=False)
+    df.to_csv(DIRS["raw"] / "sfdr_latest.csv", index=False)
+
+    for sfdr_label in df["SFDR"].unique():
+        slug = sfdr_label.replace(". ", "").replace(" ", "_").lower()
+        df[df["SFDR"] == sfdr_label].to_csv(
+            DIRS["raw"] / f"{slug}_latest.csv", index=False
+        )
+
+    print(f"✓ Salvato → {out}")
     return df
 
 
 # ═══════════════════════════════════════════════════════════════
-#  YFINANCE
+#  YFINANCE  →  etf_data/02_enriched/
 # ═══════════════════════════════════════════════════════════════
-
-def _ticker_variants(isin):
-    return [f"{isin}.MI", isin]
-
 
 def fetch_price(isin):
     for ticker_str in _ticker_variants(isin):
@@ -319,40 +383,7 @@ def fetch_price(isin):
     return isin, None
 
 
-def fetch_storico(isin, period, max_retries=4):
-    errori = []
-    for ticker_str in _ticker_variants(isin):
-        for attempt in range(max_retries):
-            try:
-                storico = yf.Ticker(ticker_str).history(period=period, auto_adjust=True)
-                if not storico.empty:
-                    storico["ISIN"] = isin
-                    return isin, storico
-                errori.append(f"{ticker_str}: empty")
-                break
-            except Exception as e:
-                msg = str(e)
-                if "Invalid ISIN" in msg:
-                    errori.append(f"{ticker_str}: Invalid ISIN")
-                    break
-                if "Too Many Requests" in msg or "rate limit" in msg.lower():
-                    if attempt < max_retries - 1:
-                        wait = (2 ** (attempt + 1)) + random.uniform(0, 1.5)
-                        time.sleep(wait)
-                        continue
-                errori.append(f"{ticker_str}: {msg[:60]}")
-                break
-
-    # ✅ Stampa solo i primi 20 fallimenti per non spammare
-    if len(errori) > 0:
-        print(f"[FAIL] {isin}: {' | '.join(errori)}")
-    return isin, None
-
-
-def enrich_with_yfinance(df,
-                          workers=None,
-                          batch_size=None,
-                          batch_pause=None):
+def enrich_with_yfinance(df, workers=None, batch_size=None, batch_pause=None):
     global stop_flag
     stop_flag = False
     workers     = workers     or CONFIG["enrich_workers"]
@@ -362,12 +393,12 @@ def enrich_with_yfinance(df,
     df = df.copy()
     df["ISIN"] = df["Link"].apply(extract_isin_from_href)
     isins = df["ISIN"].dropna().tolist()
+    n_batches = -(-len(isins) // batch_size)
 
     print(f"[INFO] {len(isins)} ISIN — {workers} workers, batch {batch_size}, pausa {batch_pause}s")
 
     prices = {}
     failed = 0
-    n_batches = -(-len(isins) // batch_size)  # ceil
 
     for batch_idx, batch_start in enumerate(range(0, len(isins), batch_size), 1):
         if stop_flag:
@@ -387,24 +418,71 @@ def enrich_with_yfinance(df,
                     failed += 1
 
         df["YF_Price"] = df["ISIN"].map(prices)
-        df.to_csv("etf_enriched.csv", index=False)
+
+        # ✅ Checkpoint nella cartella enriched
+        df.to_csv(DIRS["enriched"] / "enriched_latest.csv", index=False)
         print(f"    batch {batch_idx}/{n_batches} — "
-              f"{len(prices)}/{len(isins)} completati | {failed} senza prezzo | salvato ✓")
+              f"{len(prices)}/{len(isins)} | {failed} senza prezzo | ✓")
 
         if batch_start + batch_size < len(isins) and not stop_flag:
             time.sleep(batch_pause)
 
-    print(f"\n✓ etf_enriched.csv — {len(df)} ETF, {failed} senza prezzo")
+    # ✅ Salva versione finale con timestamp
+    out = DIRS["enriched"] / f"enriched_{session_label()}.csv"
+    df.to_csv(out, index=False)
+
+    # ✅ Salva anche filtrato per prezzo disponibile / non disponibile
+    df[df["YF_Price"].notna()].to_csv(
+        DIRS["enriched"] / "enriched_con_prezzo.csv", index=False
+    )
+    df[df["YF_Price"].isna()].to_csv(
+        DIRS["enriched"] / "enriched_senza_prezzo.csv", index=False
+    )
+
+    print(f"\n✓ {out}")
+    print(f"   con prezzo:    {df['YF_Price'].notna().sum()} ETF")
+    print(f"   senza prezzo:  {df['YF_Price'].isna().sum()} ETF")
     return df
 
 
-def download_storico(df,
-                      period=None,
-                      workers=None,
-                      batch_size=None,
-                      batch_pause=None):
+# ═══════════════════════════════════════════════════════════════
+#  STORICO  →  etf_data/03_storico/
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_storico(isin, period, max_retries=4):
+    if _exchange_cache.get(isin) == "NOT_FOUND":
+        return isin, None
+
+    for ticker_str in _ticker_variants(isin):
+        for attempt in range(max_retries):
+            try:
+                storico = yf.Ticker(ticker_str).history(period=period, auto_adjust=True)
+                if not storico.empty:
+                    storico["ISIN"] = isin
+                    _exchange_cache[isin] = ticker_str.split(".")[-1] if "." in ticker_str else "bare"
+                    return isin, storico
+                break
+            except Exception as e:
+                msg = str(e)
+                if "Invalid ISIN" in msg:
+                    break
+                if "currentTradingPeriod" in msg:
+                    _exchange_cache[isin] = "NOT_FOUND"
+                    break
+                if "Too Many Requests" in msg or "rate limit" in msg.lower():
+                    if attempt < max_retries - 1:
+                        time.sleep((2 ** (attempt + 1)) + random.uniform(0, 1.5))
+                        continue
+                break
+
+    _exchange_cache[isin] = "NOT_FOUND"
+    return isin, None
+
+
+def download_storico(df, period=None, workers=None, batch_size=None, batch_pause=None):
+    _load_exchange_cache()
     global stop_flag
-    stop_flag = False
+    stop_flag   = False
     period      = period      or CONFIG["default_period"]
     workers     = workers     or CONFIG["storico_workers"]
     batch_size  = batch_size  or CONFIG["storico_batch_size"]
@@ -415,11 +493,12 @@ def download_storico(df,
         df["ISIN"] = df["Link"].apply(extract_isin_from_href)
 
     isins = df["ISIN"].dropna().tolist()
-    checkpoint_file = f"storico_{period}.csv"
 
-    # ── Checkpoint ───────────────────────────────────────────────
+    # ✅ Checkpoint nella cartella storico
+    checkpoint_file = DIRS["storico"] / f"storico_{period}.csv"
+
     all_storico = {}
-    if os.path.exists(checkpoint_file):
+    if checkpoint_file.exists():
         try:
             df_cp = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
             if "ISIN" in df_cp.columns and not df_cp.empty:
@@ -469,75 +548,24 @@ def download_storico(df,
             if batch_start + batch_size < len(isins) and not stop_flag:
                 time.sleep(batch_pause)
 
+    _save_exchange_cache()
+
     if not all_storico:
         print("[WARNING] Nessun storico scaricato.")
         return pd.DataFrame()
 
-    # ✅ Analisi errori
-    errori_tipo = {"rate_limit": 0, "invalid_isin": 0, "empty": 0, "altro": 0}
-
-    # Nel loop sostituisci fetch_storico con una versione che traccia il tipo
-    # Oppure più semplice — dopo il download analizza i falliti:
-
-    falliti = [isin for isin in isins if isin not in all_storico]
-    if falliti:
-        print(f"\n── Analisi {len(falliti)} falliti ──")
-        # Testa i primi 5 manualmente
-        for isin in falliti[:5]:
-            for ticker_str in _ticker_variants(isin):
-                try:
-                    t = yf.Ticker(ticker_str)
-                    storico = t.history(period="5d")
-                    info = t.fast_info
-                    print(f"  {ticker_str}: righe={len(storico)}, exchange={getattr(info, 'exchange', 'N/A')}")
-                except Exception as e:
-                    print(f"  {ticker_str}: ERRORE — {e}")
-
     df_storico = pd.concat(all_storico.values())
-    df_storico.to_csv(checkpoint_file)
-    print(f"\n✓ {checkpoint_file} — {len(all_storico)} ETF, {failed} falliti")
+
+    # ✅ Salva versione finale con timestamp
+    out = DIRS["storico"] / f"storico_{period}_{session_label()}.csv"
+    df_storico.to_csv(out)
+
+    print(f"\n✓ {out} — {len(all_storico)} ETF, {failed} non trovati su Yahoo")
     return df_storico
 
-def debug_falliti(df, n=10):
-    if "ISIN" not in df.columns:
-        df = df.copy()
-        df["ISIN"] = df["Link"].apply(extract_isin_from_href)
-
-    checkpoint_file = "storico_6mo.csv"
-    scaricati = set()
-    if os.path.exists(checkpoint_file):
-        df_cp = pd.read_csv(checkpoint_file, index_col=0, parse_dates=True)
-        if "ISIN" in df_cp.columns:
-            scaricati = set(df_cp["ISIN"].unique())
-
-    falliti = [i for i in df["ISIN"].dropna() if i not in scaricati]
-    # ✅ Deduplica — ci sono duplicati nella lista
-    falliti = list(dict.fromkeys(falliti))
-    print(f"Totale falliti unici: {len(falliti)} — testo i primi {n}:\n")
-
-    trovati = 0
-    for isin in falliti[:n]:
-        print(f"── {isin} ──")
-        for ticker_str in _ticker_variants(isin):
-            try:
-                storico = yf.Ticker(ticker_str).history(period="5d", auto_adjust=True)
-                info    = yf.Ticker(ticker_str).fast_info
-                exch    = getattr(info, "exchange", "N/A")
-                curr    = getattr(info, "currency", "N/A")
-                righe   = len(storico)
-                status  = "✅ DATI" if righe > 0 else "❌ empty"
-                print(f"  {ticker_str}: {status} | righe={righe} | exchange={exch} | currency={curr}")
-                if righe > 0:
-                    trovati += 1
-                    break
-            except Exception as e:
-                print(f"  {ticker_str}: ERRORE — {e}")
-        print()
-
-    print(f"Trovati con nuovi suffissi: {trovati}/{min(n, len(falliti))}")
 
 # ═══════════════════════════════════════════════════════════════
-#  ANALISI
+#  ANALISI  →  etf_data/04_analisi/
 # ═══════════════════════════════════════════════════════════════
 
 def get_risk_free():
@@ -566,11 +594,11 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
     print(f"[INFO] {df_storico['ISIN'].nunique()} ETF | "
           f"mediana righe: {mediana:.0f} | filtro min: {min_righe}")
 
-    # ── Benchmark — prova più varianti ───────────────────────────
+    # ── Benchmark ────────────────────────────────────────────────
     print(f"\n[INFO] Scarico benchmark {benchmark_isin}...")
     time.sleep(10)
     bench_ret = None
-    for ticker_str in [benchmark_isin, f"{benchmark_isin}.MI", f"{benchmark_isin}.L"]:
+    for ticker_str in _ticker_variants(benchmark_isin):
         for attempt in range(3):
             try:
                 bench = yf.Ticker(ticker_str).history(period="2y", auto_adjust=True)
@@ -579,15 +607,14 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
                     print(f"[INFO] Benchmark ({ticker_str}): {len(bench_ret)} righe ✓")
                     break
             except Exception:
-                wait = (2 ** (attempt + 1)) + random.uniform(0, 2)
-                time.sleep(wait)
+                time.sleep((2 ** (attempt + 1)) + random.uniform(0, 2))
         if bench_ret is not None:
             break
 
     if bench_ret is None:
         print("[WARN] Benchmark non disponibile — Beta/Alpha saranno NaN")
 
-    # ── Calcolo metriche ─────────────────────────────────────────
+    # ── Metriche ─────────────────────────────────────────────────
     print("[INFO] Calcolo metriche...\n")
     outlier_skip = 0
 
@@ -596,12 +623,11 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
         if len(close) < min_righe:
             continue
 
-        ret = close.ffill().pct_change(fill_method=None).dropna()
+        ret        = close.ffill().pct_change(fill_method=None).dropna()
         rend_annuo = ret.mean() * 252
         vol_annua  = ret.std()  * np.sqrt(252)
 
-        # ✅ Filtra outlier — dati chiaramente corrotti
-        if abs(rend_annuo) > 5.0 or vol_annua > 2.0:  # >500% rendimento o >200% volatilità
+        if abs(rend_annuo) > 5.0 or vol_annua > 2.0:
             outlier_skip += 1
             continue
 
@@ -611,11 +637,15 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
         beta = alpha = None
         if bench_ret is not None:
             try:
-                comune = ret.index.intersection(bench_ret.index)
+                ret_idx   = ret.index.tz_localize(None) if ret.index.tzinfo else ret.index
+                bench_idx = bench_ret.index.tz_localize(None) if bench_ret.index.tzinfo else bench_ret.index
+                ret_c     = ret.copy();       ret_c.index   = ret_idx
+                bench_c   = bench_ret.copy(); bench_c.index = bench_idx
+                comune    = ret_c.index.intersection(bench_c.index)
                 if len(comune) > 5:
-                    r, b = ret.loc[comune], bench_ret.loc[comune]
+                    r, b = ret_c.loc[comune], bench_c.loc[comune]
                     cov  = np.cov(r, b)
-                    beta = cov[0, 1] / cov[1, 1]
+                    beta  = cov[0, 1] / cov[1, 1]
                     alpha = (rend_annuo - risk_free) - beta * (b.mean() * 252 - risk_free)
             except Exception:
                 pass
@@ -637,7 +667,7 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
         })
 
     if outlier_skip > 0:
-        print(f"[INFO] {outlier_skip} ETF scartati per dati anomali (rendimento >500% o volatilità >200%)")
+        print(f"[INFO] {outlier_skip} ETF scartati per dati anomali")
 
     if not risultati:
         print("[WARNING] Nessun ETF ha superato il filtro.")
@@ -645,32 +675,67 @@ def analisi_etf(df_storico, df_enriched=None, risk_free=None, benchmark_isin=Non
 
     df_analisi = pd.DataFrame(risultati).sort_values("Sharpe_Ratio", ascending=False)
 
+    # ── Merge metadati ───────────────────────────────────────────
     if df_enriched is not None and "ISIN" in df_enriched.columns:
-        meta_cols = ["ISIN"] + [c for c in ["Nome", "TER", "SFDR"] if c in df_enriched.columns]
+        meta_cols = ["ISIN"] + [c for c in ["Nome", "TER", "SFDR", "YF_Price"] if c in df_enriched.columns]
         df_analisi = df_analisi.merge(
             df_enriched[meta_cols].drop_duplicates("ISIN"),
             on="ISIN", how="left"
         )
 
-    print("── TOP 10 per Sharpe Ratio ──────────────────")
+    sl = session_label()
+
+    # ✅ File completo
+    out_full = DIRS["analisi"] / f"analisi_completa_{sl}.csv"
+    df_analisi.to_csv(out_full, index=False)
+    df_analisi.to_csv(DIRS["analisi"] / "analisi_latest.csv", index=False)
+
+    # ✅ Top 50 per Sharpe
+    df_analisi.head(50).to_csv(DIRS["analisi"] / f"top50_sharpe_{sl}.csv", index=False)
+
+    # ✅ Filtro per SFDR se disponibile
+    if "SFDR" in df_analisi.columns:
+        for sfdr_label in df_analisi["SFDR"].dropna().unique():
+            slug = sfdr_label.replace(". ", "").replace(" ", "_").lower()
+            df_analisi[df_analisi["SFDR"] == sfdr_label].to_csv(
+                DIRS["analisi"] / f"analisi_{slug}_{sl}.csv", index=False
+            )
+
+    # ✅ Filtro per rendimento positivo
+    df_analisi[df_analisi["Rendimento_annuo%"] > 0].to_csv(
+        DIRS["analisi"] / f"analisi_rend_positivo_{sl}.csv", index=False
+    )
+
+    # ✅ Filtro per bassa volatilità (sotto mediana)
+    mediana_vol = df_analisi["Volatilita_annua%"].median()
+    df_analisi[df_analisi["Volatilita_annua%"] < mediana_vol].to_csv(
+        DIRS["analisi"] / f"analisi_bassa_vol_{sl}.csv", index=False
+    )
+
+    print(f"\n── TOP 10 per Sharpe Ratio ──────────────────")
     print(df_analisi.head(10).to_string(index=False))
-    df_analisi.to_csv("analisi_etf.csv", index=False)
-    print("\n✓ Salvato in analisi_etf.csv")
+    print(f"\n✓ File salvati in {DIRS['analisi']}/")
+    print(f"   analisi_completa_{sl}.csv  ({len(df_analisi)} ETF)")
+    print(f"   top50_sharpe_{sl}.csv")
+    print(f"   analisi_rend_positivo_{sl}.csv  ({(df_analisi['Rendimento_annuo%'] > 0).sum()} ETF)")
+    print(f"   analisi_bassa_vol_{sl}.csv  ({(df_analisi['Volatilita_annua%'] < mediana_vol).sum()} ETF)")
+
     return df_analisi
 
+
 # ═══════════════════════════════════════════════════════════════
-#  STORICO — SELEZIONE INTERATTIVA
+#  SELEZIONE STORICO INTERATTIVA
 # ═══════════════════════════════════════════════════════════════
 
 def scegli_o_scarica_storico(df):
-    storici = sorted(glob.glob("storico_*.csv"))
+    storici = sorted(DIRS["storico"].glob("storico_*.csv"))
 
     if storici:
         print("\n── Storici disponibili ──────────────────────")
         for i, f in enumerate(storici, 1):
-            mtime   = datetime.fromtimestamp(os.path.getmtime(f)).strftime("%d/%m/%Y %H:%M")
-            size_kb = os.path.getsize(f) // 1024
-            print(f"  {i}. {f}  ({mtime}, {size_kb} KB)")
+            mtime   = datetime.fromtimestamp(f.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+            size_kb = f.stat().st_size // 1024
+            print(f"  {i}. {f.name}  ({mtime}, {size_kb} KB)")
         n = len(storici)
         print(f"  {n+1}. Riprendi download interrotto")
         print(f"  {n+2}. Scarica nuovo (sovrascrive checkpoint)")
@@ -680,25 +745,68 @@ def scegli_o_scarica_storico(df):
         try:
             idx = int(scelta) - 1
             if 0 <= idx < n:
-                print(f"[INFO] Carico {storici[idx]}...")
+                print(f"[INFO] Carico {storici[idx].name}...")
                 df_s = pd.read_csv(storici[idx], index_col=0, parse_dates=True)
                 print(f"✓ {df_s['ISIN'].nunique()} ETF, {len(df_s)} righe")
                 return df_s
             elif idx == n:
-                period = input(f"Periodo da riprendere [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
+                period = input(f"Periodo [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
                 return download_storico(df, period=period)
             elif idx == n + 1:
                 period = input(f"Periodo [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
-                cp = f"storico_{period}.csv"
-                if os.path.exists(cp):
-                    os.remove(cp)
+                cp = DIRS["storico"] / f"storico_{period}.csv"
+                if cp.exists():
+                    cp.unlink()
                     print("[INFO] Checkpoint rimosso — ricomincio da zero")
                 return download_storico(df, period=period)
         except (ValueError, IndexError):
-            print("[WARN] Scelta non valida — scarico nuovo storico")
+            print("[WARN] Scelta non valida.")
 
     period = input(f"Periodo [{CONFIG['default_period']}]: ").strip() or CONFIG["default_period"]
     return download_storico(df, period=period)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DEBUG
+# ═══════════════════════════════════════════════════════════════
+
+def debug_falliti(df, n=10):
+    if "ISIN" not in df.columns:
+        df = df.copy()
+        df["ISIN"] = df["Link"].apply(extract_isin_from_href)
+
+    scaricati = set()
+    for f in DIRS["storico"].glob("storico_*.csv"):
+        try:
+            df_cp = pd.read_csv(f, index_col=0, parse_dates=True)
+            if "ISIN" in df_cp.columns:
+                scaricati.update(df_cp["ISIN"].unique())
+        except Exception:
+            pass
+
+    falliti = list(dict.fromkeys(i for i in df["ISIN"].dropna() if i not in scaricati))
+    print(f"Totale falliti unici: {len(falliti)} — testo i primi {n}:\n")
+
+    suffissi = [".MI", ".SG", ".DE", ".F", ".PA", ".AS", ".L", ".SW", ".BE", ""]
+    trovati  = 0
+
+    for isin in falliti[:n]:
+        print(f"── {isin} ──")
+        for suf in suffissi:
+            ticker_str = f"{isin}{suf}" if suf else isin
+            try:
+                storico = yf.Ticker(ticker_str).history(period="5d", auto_adjust=True)
+                righe   = len(storico)
+                status  = "✅" if righe > 0 else "❌"
+                print(f"  {ticker_str}: {status} righe={righe}")
+                if righe > 0:
+                    trovati += 1
+                    break
+            except Exception as e:
+                print(f"  {ticker_str}: ERRORE — {str(e)[:50]}")
+        print()
+
+    print(f"Recuperabili: {trovati}/{min(n, len(falliti))}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -706,7 +814,9 @@ def scegli_o_scarica_storico(df):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    print("╔══════════════════════════════════════════════╗")
+    init_dirs()
+
+    print("\n╔══════════════════════════════════════════════╗")
     print("║       ETF Data Analysis Tool                 ║")
     print("║       Fonte: Borsa Italiana + yfinance       ║")
     print("╚══════════════════════════════════════════════╝\n")
@@ -735,16 +845,16 @@ def main():
 
     if input("\nScaricare storico prezzi? [y/n]: ").strip().lower() == "y":
         df_storico = scegli_o_scarica_storico(df)
-
         if not df_storico.empty:
             if input("\nCalcolare Sharpe, Drawdown, Beta, Alpha? [y/n]: ").strip().lower() == "y":
                 analisi_etf(df_storico, df_enriched=df)
 
 
 if __name__ == "__main__":
-    main()
-
-if __name__ == "__main__":
-    # ✅ debug temporaneo — commenta dopo
-    df = pd.read_csv("etf_sfdr.csv")  # o etf_borsa_italiana.csv
-    debug_falliti(df, n=10)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "debug":
+        init_dirs()
+        df = pd.read_csv(DIRS["raw"] / "sfdr_latest.csv")
+        debug_falliti(df, n=10)
+    else:
+        main()
