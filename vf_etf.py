@@ -339,12 +339,13 @@ def fetch_price(isin: str) -> tuple:
     return isin, None
 
 
-def enrich_with_yfinance(
+def enrich_with_yfinance(   
     df: pd.DataFrame,
     workers: int | None = None,
     batch_size: int | None = None,
     batch_pause: float | None = None,
 ) -> pd.DataFrame:
+    init_dirs()       
     global stop_flag
     stop_flag   = False
     workers     = workers     or CONFIG["enrich_workers"]
@@ -504,6 +505,7 @@ def download_storico(
     batch_size: int | None = None,
     batch_pause: float | None = None,
 ) -> pd.DataFrame:
+    init_dirs()          # ← aggiunto: garantisce che le cartelle esistano
     _load_exchange_cache()
     global stop_flag
     stop_flag   = False
