@@ -1,1 +1,3 @@
-ISIN,Rendimento_annuo%,Perf_1mese%,Perf_6mesi%,Perf_1anno%,Volatilita_annua%,Max_Drawdown%,VaR_95%_giorno,CVaR_95%_giorno,Ulcer_Index,Sharpe_Ratio,Sortino_Ratio,Calmar_Ratio,Omega_Ratio,Pain_Ratio,Beta,Alpha%,R_Squared,Tracking_Error%,Information_Ratio,Winrate%
+version https://git-lfs.github.com/spec/v1
+oid sha256:780d96144a1d00ed7c1423124c04a4a159e1b223d41a9c0818153e4640170509
+size 262
