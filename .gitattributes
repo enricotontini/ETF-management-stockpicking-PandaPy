@@ -1,0 +1,1 @@
+etf_data/03_storico/*.csv filter=lfs diff=lfs merge=lfs -text

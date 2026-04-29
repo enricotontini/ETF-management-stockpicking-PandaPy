@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import pandas as pd
 import yfinance as yf
 import requests
@@ -27,9 +29,9 @@ CONFIG = {
     "enrich_workers":      4,
     "enrich_batch_size":   30,
     "enrich_batch_pause":  3.0,
-    "storico_workers":     2,
-    "storico_batch_size":  20,
-    "storico_batch_pause": 8.0,
+    "storico_workers":     4,
+    "storico_batch_size":  40,
+    "storico_batch_pause": 5.0,
     "default_period":      "6mo",
     "benchmark_isin":      "IE00B4L5Y983",
 }
